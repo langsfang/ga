@@ -8,11 +8,11 @@ Genvagent 分为 **Agent Harness** 和 **Memory System** 两个可独立实现�
 
 | 文档 | 主要问题 |
 | --- | --- |
-| [系统对接协议](integration-protocol.md) | 身份与会话映射、数据格式、读写时点、幂等、并发、恢复与兼容性 |
+| [交互模型与对接协议](integration-protocol.md) | 原始记录、长期记忆与工作上下文的关系；任务中的交互流程；对应的数据与接口 |
 | [Agent Harness](agent-harness.md) | 核心能力、插件扩展点、dsh/pi 适配与上下文管理 |
 | [Memory System](memory-system.md) | 记录、上下文存储、记忆检索、dreaming，以及单机和集群拓扑 |
 
-建议先审阅对接协议，再分别审阅两个系统。接口文档是共同契约，不构成第三个业务系统。
+建议先阅读交互模型中的概念和任务示例，再分别审阅两个系统及接口细节。接口文档是共同契约，不构成第三个业务系统。
 
 ## 2. 总体关系
 

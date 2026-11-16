@@ -5,7 +5,7 @@ Genvagent 由两个系统组成：以插件接入 dsh、pi 等宿主的 **Agent 
 当前阶段：架构设计，尚未实现运行时代码。
 
 - [整体架构与边界](docs/architecture.md)
-- [系统对接协议](docs/integration-protocol.md)：优先阅读，定义两侧的数据、读写时点与恢复保证。
+- [交互模型与对接协议](docs/integration-protocol.md)：先理解两侧交换哪些信息、一次任务如何流转，再查看类型与接口。
 - [Agent Harness](docs/agent-harness.md)：核心模块、插件契约、dsh/pi 适配及关键结构。
 - [Memory System](docs/memory-system.md)：记忆管理、后台维护、关键结构和单机/集群部署。
 
