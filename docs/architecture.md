@@ -1,6 +1,6 @@
 # Genvagent：统一用户记忆与可恢复的 Agent 执行
 
-状态：设计草案 v0.7；2026-11-17。当前仓库仅包含设计文档。
+状态：设计草案 v0.8；2026-11-17。当前仓库仅包含设计文档。
 
 Genvagent 包含两个系统：**Agent Harness** 管理 Router、任务路由、执行循环和工作上下文；**Memory System** 按 user 保存证据、可复用记忆及持久执行状态，独立部署于单机或集群。
 
@@ -12,13 +12,15 @@ Genvagent 包含两个系统：**Agent Harness** 管理 Router、任务路由、
 
 ```text
 User Memory
-  原始证据
-    用户输入、模型输出、工具结果、外部材料及来源
+  Sessions：持续工作的边界
+    History：输入、观察、输出与变化的可追溯记录
+    Context：当前工作状态及其版本，引用历史和其他记忆
   可复用记忆条目
     事实、偏好、目标、方法、经历、notes
     每条保留适用条件、时效、证据与修订
-  持久执行状态
-    sessions、context 版本、任务与执行记录
+
+Memory 服务另提供执行协作存储
+  任务状态、输入队列、通知与临时写入权；调度由 Harness 负责
 
 基于上述对象形成的视图
   用户画像：有关用户特征、偏好、目标与约束的记忆及来源
@@ -40,6 +42,8 @@ User Memory
 工作 context 是某个 session 当前使用的工作视图，通常承载当前目标和短期执行状态，但不等于用户的全部短期记忆。多个 session 可以同时持有不同目标；Router 按需读取它们及可复用记忆。
 
 集合可以不存在。一条 note 不必属于集合，也可关联多个集合；project notes 只是一种可选的资料组织方式，不进入系统的核心类型划分。第一版仍以单用户记忆域为边界，不设计跨用户团队知识库。
+
+Session 组织 History 与 Context：前者保存经历，后者保存当前如何继续。历史落盘不等于长期知识，Context 压缩不等于记忆沉淀；事件中的执行控制记录也不默认参与知识召回。完整对象关系与接口提供方见[概念模型与能力边界](integration-protocol.md)。
 
 ## 2. Process、Session、Context 与 Task
 
@@ -212,6 +216,7 @@ CLM 延后作为对照实验，不作为第一版依赖，也不向模型开放�
 | 记忆整理、notes 修订与删除 | Memory Agent / 维护任务 | 带来源修订、状态、失效和保留策略 |
 | 外部工具、文件和活跃进程 | 执行环境 / Host | 执行日志、外部状态与恢复机制 |
 
-1. [交互逻辑与接口](integration-protocol.md)：按消息同步、任务协作、checkpoint 和维护划分接口。
+1. [概念模型与能力边界](integration-protocol.md)：先说明对象关系与管理责任，再说明各层接口的提供方、调用方和交互逻辑。
 2. [Agent Harness](agent-harness.md)：Router/Worker 两个 loop、compact 基线和接入方式。
 3. [Memory System](memory-system.md)：存储、任务视图、session 维护、notes 生命周期及部署。
+4. [接口实现参考](integration-reference.md)：候选函数、载荷和传输机制，待概念模型确认后进一步细化。

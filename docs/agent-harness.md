@@ -1,6 +1,6 @@
 # Agent Harness：Router 响应、Worker 循环与状态同步
 
-状态：设计草案 v0.7；2026-11-17。第一版采用 append + compact。共享类型与 Memory 接口见[交互协议](integration-protocol.md)。
+状态：设计草案 v0.8；2026-11-17。第一版采用 append + compact。先读[概念模型与能力边界](integration-protocol.md)；共享载荷的实现候选见[接口实现参考](integration-reference.md)。本文描述 Harness 内部模块与执行流程。
 
 ## 1. Core 的模块与职责
 
@@ -146,7 +146,7 @@ CLM 的自由 context 编辑工具、文件编辑入口和策略学习不进入�
 
 ## 5. 执行状态结构
 
-共享 TaskDescriptor、TaskSnapshot、TaskInput、TaskNotification、SessionLease 和 checkpoint 类型由协议定义。
+TaskDescriptor、TaskSnapshot、TaskInput、TaskNotification、SessionLease 和 checkpoint 的候选载荷见[接口实现参考](integration-reference.md)。任务、通知和租约服务于执行协作；它们不是与用户知识并列的记忆类型。
 
 ### 5.1 Router turn 与执行动作
 

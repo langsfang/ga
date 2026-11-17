@@ -1,28 +1,33 @@
 # Memory System：用户记忆、持久执行状态与整理服务
 
-状态：设计草案 v0.7；2026-11-17。对外函数与共享类型见[交互协议](integration-protocol.md)。
+状态：设计草案 v0.8；2026-11-17。先读[概念模型与能力边界](integration-protocol.md)；函数与载荷的实现候选见[接口实现参考](integration-reference.md)。本文描述 Memory 内部管理与存储设计。
 
 ## 1. 记忆对象与视图
 
 Memory 以 userId 为唯一归属域，面向普通问答、学习、生活事务和工作等场景。项目、主题集合和固定画像字段都不是使用前提。
 
-### 1.1 三类持久对象
+### 1.1 领域对象及其归属
 
 | 对象 | 保存内容 | 主要写入方 |
 | --- | --- | --- |
-| 原始证据 | 用户消息、模型输出、工具结果、外部材料与执行事件 | Harness Core |
-| 记忆条目 | 带来源的事实、偏好、目标、方法、经历和 notes | 提案者 + Memory Validator |
-| 持久执行状态 | session、context 版本、task/run 记录、租约与生命周期 | Core 发起，Memory 条件提交 |
+| Session | 持续工作的身份、目的、生命周期及相关引用；归属于用户 | Harness 选择与使用，Memory 管理持久生命周期 |
+| History | Session 的经历与控制记录；Event 是其中的记录单元 | Harness 报告输入、观察与变化，Memory 保存 |
+| Context | Session 当前选定的工作状态及历史版本 | Harness 构建，Memory 保存 |
+| 记忆条目 | 用户域内带来源的事实、偏好、目标、方法、经历和 notes | 提案者 + Memory Agent / Validator |
 
-证据证明某次陈述或观察发生，不自动证明其内容正确。记忆条目保留适用条件、时间与修订；session/context 则保存尚在使用的工作状态。Worker process 不是存储分区。
+Session 组织 History 与 Context；记忆条目可以引用其来源，但不受来源 Session 的存续限制。外部材料可作为证据被记录引用，不要求把材料正文复制进每个 Session。
+
+证据证明某次陈述或观察发生，不自动证明其内容正确。记忆条目保留适用条件、时间与修订。Worker process 不是存储分区。
 
 ### 1.2 画像、短期、长期与 notes
 
 | 视图或维度 | 数据来源 | 解释 |
 | --- | --- | --- |
 | 用户画像 | 与用户有关的事实、偏好、目标及其证据 | 派生视图；区分已支持、推断和冲突，允许为空 |
-| 短期记忆 | 近期事件、当前目标、未决事项、活跃/空闲 session，以及短期条目 | 当前工作需要的信息，仍可持久化 |
+| 工作记忆 | 某个 Session 当前选定的目标、材料与进度 | 由其 Context 表达 |
+| 短期记忆 | 近期有关经历、当前目标、未决事项、相关 Session 的工作状态及短期条目 | 当前工作需要的信息，仍可持久化 |
 | 长期记忆 | 经验证适合跨会话复用的记忆条目 | 可被纠正或失效，长期不等于永久正确 |
+| 历史存档 | 旧 History 与 Context 版本 | 可追溯的资料，不自动属于长期知识 |
 | Note | MemoryKind 为 note 的整理文本 | 表达形式，可以服务短期工作或长期复用 |
 | Collection / 标签 | 对记忆和相关来源的可选组织关系 | 可以不存在；旅行、学习、项目等均可作为名称 |
 
@@ -30,9 +35,17 @@ Memory 以 userId 为唯一归属域，面向普通问答、学习、生活事�
 
 工作 context 只是某个 session 的选定工作视图，不包含该用户全部短期或长期记忆。记忆从短期转为长期需经过适用性验证；进程退出、task 完成和 session 退役都不触发自动提升。
 
-## 2. Memory 不执行 agent
+### 1.3 Session 内部如何关联
 
-Memory 保存 session、事件、checkpoint、任务状态与租约；模型和工具调用在 Harness 的执行环境中完成。
+History 保存“发生过什么”，Context 保存“当前如何继续”。Context 引用自己的历史，也可读取该用户其他 Session 的资料及记忆条目。压缩 Context 不改写 History；向 History 追加记录，也不表示该记录已经被当前 Context 处理。
+
+Memory 分别管理历史追加、工作状态版本和两者的对应关系。恢复时提供当前状态与尚未处理的记录；Harness 决定如何继续执行。Session 退役停止在线写入，历史保留与知识沉淀另行管理。
+
+## 2. 领域服务与执行协作存储
+
+Memory 的领域服务管理 Session、History、Context 和记忆条目。当前方案在同一服务内额外提供执行协作存储，保存 task/run 状态、输入队列、通知与临时写入所有权。两类能力可以共用数据库，但协作记录不自动成为用户知识。
+
+Harness 决定任务语义与调度；模型和工具调用在 Harness 的执行环境中完成。以下函数是内部设计与实现候选，不改变这条能力边界。
 
 claimSession 只登记 run 与写入权。saveCheckpoint 只保存工作快照并推进最新持久版本。Host session link 只保存原生会话定位关系。这三个动作都不调用模型，也不要求 Memory 知道进程已经加载 context。
 
@@ -78,6 +91,8 @@ Router 离线时通知保留。轮询是基础能力，订阅可降低延迟；�
 ### 3.3 记忆查询
 
 getUserOverview、getProfile、recall 和 readEvidence 保留统一用户域与来源规则。getTask 负责工作状态，recall 负责相关知识，两者不互相替代。
+
+知识召回与 Memory Agent 整理默认使用业务经历及其证据，不把请求准备、心跳或写入权变化当作知识材料。控制记录仍可按需供执行恢复和诊断读取；共享事件封装不意味着共享检索规则。
 
 关键词检索为第一版基线，可选标签/集合为空时仍可使用。索引落后于 minUserRevision 时补读权威数据或返回 NOT_READY；session 摘要保留其来源 checkpoint，不代替执行前的版本检查。
 
@@ -140,7 +155,7 @@ Memory Agent 提出变更，Validator 检查来源、状态和并发修订，再
 
 ## 6. 关键内部结构
 
-共享 SessionExitRecord、RetireRequest、TaskSnapshot、ModelInputRecord 等由协议定义。
+SessionExitRecord、RetireRequest、TaskSnapshot、ModelInputRecord 等候选载荷见[接口实现参考](integration-reference.md)。它们服务于维护和执行协作，不是新增的记忆领域对象。
 
 ### 6.1 记忆与运行记录
 

@@ -1,598 +1,198 @@
-# Harness 与 Memory：交互顺序、函数与数据结构
+# Harness 与 Memory：概念模型与能力边界
 
-状态：设计草案 v0.7；2026-11-17。接口尚未实现。第一版采用消息追加与 compact；Router 异步分派任务，Worker 独立执行。
+状态：设计草案 v0.8；2026-11-17。本文定义领域对象、对象关系及两系统之间的抽象契约，不定义字段、SDK 签名或 HTTP 协议。
 
-## 1. 先区分执行与存储
+[整体架构](architecture.md)说明系统分工；本文回答 Memory 管理什么、Harness 使用什么。具体存储机制和接口载荷另见[实现参考](integration-reference.md)，不作为理解本模型的前置条件。
 
-**Harness 负责执行，Memory 负责持久化与条件更新。** Memory 不启动进程、不加载模型输入、不调用模型或工具。
+## 1. 先区分四个层次
 
-| 名词 | 含义 |
-| --- | --- |
-| Session | Memory 中稳定的逻辑工作线程，关联事件流和 context |
-| Context checkpoint | 某次已保存的工作快照；只表示状态已持久化 |
-| Run | 某进程处理某 session 的一次执行尝试，具有独立 runId |
-| 执行环境（Runtime） | 模型客户端、工具、进程、工作目录和权限的实现 |
-| Runtime Driver | Harness 调用执行环境的接口，不是 Memory 服务 |
-| Host session link | dsh/pi 原生会话到逻辑 session 的定位索引 |
-| Task | 可跨 Router turn 运行的异步工作，保存状态、输入和结果 |
-| Session lease | 同一 session 的临时写入权，防止两个执行者并发修改 |
-
-一个 session 可以由不同进程先后执行，事件序号和 contextId 不重置。Host session link 只帮助找到 session；它不会获得 lease，也不会启动 run。
-
-Memory 中“最新 checkpoint”与“某次模型调用使用的输入”分开记录。前者由 saveCheckpoint 更新，后者由 Driver 准备后作为请求事件保存；快照保存成功不证明模型已运行。
-
-## 2. Router 与 Worker 的异步协作
-
-### 2.1 接收、分派与响应
-
-1. 用户输入在 Router session 中持久化，开启一个短 Router turn。
-2. Router 根据对话、记忆和已有 session 选择回应、澄清，或 new/resume/fork。
-3. Core 保存稳定的 taskId 和目标选择，创建或核对目标 session，再 recordTask。
-4. recordTask 提交后，delegate 返回 TaskAccepted，表示工作已经持久接收。Core 的后台 Dispatcher 安排 Worker。
-5. Router 可回复接收状态并结束本 turn，继续接收用户输入，不等待 Worker 完成。
-
-Router 只做对话、路由、任务查询和控制。耗时研究、文件操作、复杂分析及业务工具调用交给 Worker。一个 session 只允许一个有效 writer；选定 session 忙碌时，任务排队。
-
-new 创建独立工作状态；resume 继续目标一致的状态；fork 从固定版本创建独立分支。普通消息追加和 compact 都不创建新 session，只保存同一 contextId 下的新版本。
-
-### 2.2 Worker 开始执行
-
-```text
-Harness Dispatcher
-  1. allocateWorker：分配进程
-  2. Memory.claimSession：登记本次 run 并取得 session 写入权
-  3. readCheckpoint + readEvents：取得已保存工作状态及增量
-  4. Driver.attachSession：建立本地执行容器，恢复工作副本
-  5. 核对未完成动作，读取待处理任务输入
-  6. Worker loop 开始
-```
-
-claimSession 的服务端行为只是数据库事务：校验 session 开放、没有其他有效 writer、版本和授权有效，然后保存租约与 run 记录。它不远程调用 Driver，不代表进程已经开始工作。
-
-Host 插件需要时，可先 resolveHostSession 找到逻辑 session，或在建立原生容器后 linkHostSession。这个适配索引与 lease 独立；纯 Genvagent Runner 不需要 Host 索引。
-
-### 2.3 Worker 每一步如何更新 context
-
-```text
-已完成的模型消息 / 工具结果 / 当前任务输入
-  → appendEvents：先保存原始事件
-  → appendMessages：在 Harness 内更新 context 工作副本
-  → 按阈值 compact：仍由 Harness 处理，保留约束与来源
-  → saveCheckpoint：原子保存快照并推进最新持久版本
-  → Driver.prepareModelCall：按快照及运行配置准备实际输入
-  → appendEvents(model_request_prepared)：记录 checkpoint、输入及覆盖范围
-  → Driver.invokeModel：发起模型调用
-  → 保存模型输出，处理工具，再回到本循环
-```
-
-下一模型调用前、正常暂停和完成前必须保存 checkpoint。流式 delta 可先展示，完整或中断消息按实际状态落盘。原始事件与工作快照是不同对象；compact 不删除原始消息。
-
-prepareModelCall、invokeModel 是 Harness 的本地执行接口。Memory 不提供“加载 context”或“激活模型输入”的 RPC。Host 插件在实际请求边界准备输入并放行原生调用，不另起一个重复模型请求。
-
-### 2.4 Worker 状态如何到达 Router
-
-Worker 在状态变化和阶段完成时追加 TaskUpdate 事件。appendEvents 在同一事务更新 TaskSnapshot；completed、failed、waiting_input 等变化同时生成持久 TaskNotification。普通心跳只更新运行活动时间，不触发 Router 模型调用。
-
-Router 可以 getTask 查询当前阶段、简短进度、最新 checkpoint、结果与证据。需要诊断时再读取具体 Worker 事件或快照，默认不复制整个 Worker context。
-
-任务通知开启新的 Router turn。原 delegate 调用已经由 TaskAccepted 结束，因此任务完成通知不能成为它的第二次工具结果。通知包含原 taskId 与 originTurnId，保留对话关联。
-
-用户的纠正或取消通过 postTaskInput 写入持久任务输入队列。Worker 在安全边界读取，保存处理结果并确认该输入；Router 不越过 Worker lease 直接追加其工作消息。取消是请求，不证明外部工具已停止。
-
-### 2.5 完成与释放
-
-Worker 保存最终消息和 checkpoint，再提交任务终态及结果。Memory 生成通知；Harness 通过 releaseSession 结束写入占用，然后释放或清理进程。任务完成默认不退役 session。
-
-Router 不在线时通知仍保留。重新上线后读取通知，并将其追加到自己的事件流；该追加按 notificationId 去重，同时标记通知已投递。Router 关闭不会丢失 Worker 结果；若运行 Worker 的整个 Host 退出，则按恢复机制处理，不假设它继续执行。
-
-## 3. 函数按责任分组
-
-### 3.1 Harness 本地执行函数
-
-| 函数 | 调用者 → 执行者 | 实际操作 |
+| 层次 | 要说明的内容 | 本文的位置 |
 | --- | --- | --- |
-| submitUserMessage | UI/Host → Core | 保存输入、安排 Router turn |
-| dispatchTask | Router/Core → Dispatcher | 保存目标与任务，返回 TaskAccepted |
-| allocateWorker | Dispatcher → Driver | 分配有能力的进程 |
-| attachSession | Core → Driver | 加载工作副本，建立暂停状态的执行容器 |
-| appendMessages / compactContext | Core → Context Controller | 修改本地工作视图，不直接写 Memory |
-| prepareModelCall | Core → Driver | 生成本次请求输入及可记录的证明 |
-| invokeModel / executeTool | Core → Driver | 真正执行模型或工具 |
-| acceptCompletion | Driver → Core | 保存结果，推进 Worker loop |
-| reconcile / detachSession | Core → Driver | 核对外部动作，或释放挂载 |
+| 领域模型 | User Memory、Session、History、Context、记忆条目分别是什么，如何关联 | 第 2–4 节 |
+| 系统能力边界 | 谁暴露接口、谁调用、操作哪个对象、承诺什么结果 | 第 5 节 |
+| 交互逻辑 | 一次工作如何记录经历、形成 context、恢复执行和沉淀记忆 | 第 6 节 |
+| 实现机制 | 函数名、字段、HTTP、数据库、锁、租约、版本比较、通知投递 | 实现参考及各系统内部设计 |
 
-### 3.2 持久 session 与写入权
+接口是对领域对象提供的能力。不能用一组 RPC 名称代替对象模型，也不能从数据库表或事件类型反推业务概念。
 
-| Memory 函数 | 输入 | 返回 / 服务端事务 |
+## 2. Memory 管理的核心对象
+
+### 2.1 User Memory：用户的统一记忆域
+
+User Memory 包含该用户的工作经历、会话工作状态和可复用知识。用户切换进程、Host、任务或话题，不会因此得到另一套用户记忆。
+
+用户画像、短期记忆、长期记忆是对这些信息的不同组织与使用方式。notes 是表达形式，主题集合是可选分类；它们不构成独立的用户归属域。
+
+### 2.2 Session：一段持续工作的边界
+
+Session 表示一段可以持续、暂停和恢复的工作，负责把相关经历与工作状态组织在一起。它不是一次模型调用、一个 task 或一个 Worker 进程。
+
+Memory 中，一个 Session 管理：
+
+- 工作目的、身份和生命周期。
+- 属于这段工作的 History。
+- 当前 Context 及其历史版本。
+- 与任务、来源和派生工作有关的引用。
+
+同一 Session 可以先后处理多个相关 task，由不同 Worker 继续。Router 的对话也是一种 Session。是否继续原工作、另起工作或保留分支，由 Harness 根据用户意图决定；Memory 提供相应的持久对象操作。
+
+### 2.3 History 与 Event：发生过什么
+
+History 是 Session 的可追溯记录。Event 是其中一次已记录的输入、观察或变化，例如用户消息、工具返回、任务结果。事件是记录单元，不等于消息总线中的通知。
+
+需要区分事件的两种用途：
+
+| 用途 | 例子 | 如何使用 |
 | --- | --- | --- |
-| createSession | SessionCreate | SessionState；按稳定 ID 创建记录流与 context |
-| getSession / discoverSessions | sessionId / SessionQuery | 精确状态或候选摘要 |
-| claimSession | sessionId、ClaimRequest | SessionClaim；登记 run，分配单调 epoch 的租约 |
-| renewSessionClaim | SessionLease、请求时长 | 新 expiresAt；校验当前 owner/epoch |
-| releaseSession | SessionLease、ReleaseRequest | 保存本次执行结束记录、释放占用；不启动或停止进程 |
+| 工作经历与证据 | 用户要求、检索材料、工具观察、结果及纠正 | 可供回顾、Context 组装和知识提取 |
+| 执行与控制记录 | 请求准备、任务状态转换、恢复位置 | 用于调度、恢复和诊断，默认不作为知识召回材料 |
 
-若输入 request 中带有 runId，Memory 只是保存其关联。真正的模型请求仍须由 Harness 调用 invokeModel。创建、续租和释放是三种存储操作。
+这两类记录可以使用共同的底层日志机制，但不能在检索和记忆整理时不加区分地使用。任务完成通知属于协作机制；通知引用已保存的结果，不代替结果本身。
 
-### 3.3 原始记录与 checkpoint
+Memory 为 History 提供归属、追加、读取和来源追溯。新纠正追加为新记录，不通过修改旧原话掩盖历史。某条陈述被记录，只证明它曾被表达，不自动证明它正确。
 
-| Memory 函数 | 输入 | 返回 / 服务端事务 |
+### 2.4 Context：当前如何继续工作
+
+Context 是 Session 当前选定的工作状态，包括目标、约束、有关消息与证据、已有结论、进度和未决问题。它可以同时取材于本 Session 的 History 和用户的其他记忆。
+
+Context 不是全部 History，也不只是 History 的压缩文本。选择了哪些材料、采用了什么摘要、当前推进到哪一步，都是需要保存的状态，未必能仅凭原始日志自动复原。
+
+Harness 负责构建、追加和压缩 Context；Memory 保存明确版本，并提供当前版本与历史版本的读取。保存新版本改变的是这段工作的状态，不覆盖其原始 History。
+
+checkpoint 是 Context 版本的一种实现表示。它表达“这份工作状态已保存”，不表达“某个进程已经加载它”或“模型已经使用它”。
+
+### 2.5 记忆条目：哪些信息值得以后复用
+
+记忆条目表达有来源、适用条件和修订的事实、偏好、目标、方法、经历摘要或 note。它可以从会话经历中整理产生，也可以来自用户明确提出的记忆要求。
+
+条目不附属于某个进程，其可复用范围也不局限于来源 Session。新的 Session 可以读取它，来源 Session 结束后它也可以继续存在。
+
+条目是否值得长期保留，需要独立判断。Session 完成、退出或退役不是“所有内容转为长期记忆”的条件。
+
+### 2.6 对象之间的关系
+
+```mermaid
+flowchart TB
+    U[User Memory]
+    S[Session]
+    H[History / Events]
+    C[Context 及其版本]
+    K[可复用记忆条目]
+    U --> S
+    U --> K
+    S --> H
+    S --> C
+    H -.选择与概括.-> C
+    K -.按需取用.-> C
+    H -.提取与验证.-> K
+```
+
+Session 把经历和工作状态组织起来；History 保留来源，Context 支持继续执行，记忆条目支持跨会话复用。它们通过引用关联，不能把同一份信息在不同位置的副本误当成多个独立事实。
+
+## 3. 短期记忆、长期记忆与工作 Context
+
+短期/长期描述信息的用途和保留策略，不按“是否落盘”划分，也不直接对应两张表。
+
+| 概念 | 主要包含什么 | 与核心对象的关系 |
 | --- | --- | --- |
-| appendEvents | sessionId、AppendRequest、lease | AppendReceipt；事件、消费索引、任务投影和必要通知一起提交 |
-| readEvents / readEvidence | 序号范围 / EvidenceRef | 原始记录或指定记忆修订 |
-| saveCheckpoint | sessionId、CheckpointWrite、lease | CheckpointHead；快照与最新指针原子提交 |
-| readCheckpoint | ContextRef | 精确读取不可变快照 |
+| 工作记忆 | 某个 Session 当前执行所需的目标、材料和进度 | 由该 Session 的 Context 表达 |
+| 短期记忆 | 当前目标、近期有关经历、待办、未决问题和临时记忆条目 | 汇集有关 Session 的工作状态、近期 History 与短期条目；可持久恢复 |
+| 长期记忆 | 经筛选保留、预期跨会话复用的知识与经历 | 主要由带来源和适用条件的记忆条目表达 |
+| 历史存档 | 已结束工作的原始记录和旧 Context | 仍可查询，但不会因此全部成为长期知识 |
+| 用户画像 | 有关用户的事实、偏好、目标和约束 | 由有关条目与来源形成视图，不是另一套无来源事实 |
 
-saveCheckpoint 检查 lease、基线 head revision、已存在的来源和 coveredEventSequence；成功只说明“从这里可以恢复工作状态”。Driver 之后如何加载、输入是否已发出，记录在 model_request_prepared 与后续结果事件中。
+这几种视图并非互斥分区。一条长期偏好被读取到当前 Context，表示它参与了当前工作，不改变原条目的长期属性。
 
-| 场景 | Harness 的操作 | Memory 的操作 |
+三个转换需要分开：
+
+1. **Context 组装/压缩**：为当前执行选择和组织材料，改变工作视图。
+2. **记忆沉淀**：从经历中提取、验证和修订可复用知识，形成记忆条目。
+3. **历史保留/删除**：决定原始资料及版本如何保存，受独立的数据生命周期策略管理。
+
+短期信息不必沉淀为长期记忆。Context compact 不自动发布长期条目；Session 退役也不自动删除长期条目。
+
+## 4. Memory 如何管理 Session、Context 和 History
+
+| 对象 | Memory 的管理责任 | Harness 的使用责任 |
 | --- | --- | --- |
-| 恢复旧 context | 读取快照和增量，构建本地工作副本 | 返回持久内容 |
-| 保存新 context | 构建快照，调用 saveCheckpoint | 条件写入版本并推进 head |
-| 准备模型调用 | prepareModelCall，记录准备结果 | 保存引用 checkpoint 的请求事件 |
-| 发起模型调用 | invokeModel 或放行 Host 原生请求 | 不参与执行，随后保存结果 |
+| Session | 保存稳定身份和生命周期，提供发现、创建、分叉及退役能力 | 判断新建还是继续，选择执行对象，分配 Worker |
+| History | 保存有归属的经历与控制记录，支持追加和精确读取 | 报告已发生的输入、观察和结果；恢复时读取必要记录 |
+| Context | 保存工作状态版本，关联其来源和已处理经历，支持恢复 | 组装、追加、compact，准备实际模型输入 |
+| 记忆条目 | 检索、验证、整理、修订、失效与保留 | 提出信息需求，选用材料，提交纠正或知识候选 |
 
-### 3.4 任务、通知与记忆查询
+Session 的管理有两个决策来源：Harness 决定在线工作如何组织；Memory 的后台维护按既定策略管理已结束或闲置的持久对象。Memory 不因此获得启动 Worker 或执行工具的职责。
 
-| Memory 函数 | 作用 |
-| --- | --- |
-| recordTask(TaskDescriptor) | 保存目标、来源 turn 和 queued 状态，关联目标 session；不调度进程 |
-| getTask / listTasks | 返回 TaskSnapshot 或其分页列表，可按状态筛选，供 Router 查询和 Dispatcher 恢复队列 |
-| postTaskInput / readTaskInputs | 保存或读取纠正、补充、取消等待处理输入 |
-| readTaskNotifications(routerSessionId) | 读取尚未投递的任务通知；Router 追加对应事件后确认投递 |
-| getUserOverview / getProfile | 用户资料目录及带来源画像 |
-| recall(RecallRequest) | 按用户授权和可选条件检索 |
-| proposeMemory / submitFeedback | 持久化知识候选或纠正，不保证后台整理已经结束 |
-| readChanges | 用户资料和生命周期的变更流 |
+历史追加与工作状态更新是两个动作。Memory 保存 Context 时，同时记录它已处理到哪段经历；新事件已保存、Context 尚未更新是允许出现的中间状态。这个对应关系用于恢复，不能把“最新事件”直接当成“当前 Context”。
 
-TaskUpdate、任务输入确认和通知投递使用原始事件中的稳定 ID；没有另一条可随意覆盖 TaskSnapshot 的写接口。Router 创建任务及提交输入时服务端检查目标 session 仍可接收工作，并更新退役检查所需的待办索引。
+继续 Session 时，Memory 返回当前工作状态及尚未纳入的相关记录。Harness 恢复 Context，并从执行协作记录核对未完成任务和动作；仅加载 Context 不能证明外部工具已完成。
 
-### 3.5 适配与维护接口
+分叉表示创建独立 Session，并引用明确的历史状态；后续变化不写回父 Session。退役表示停止继续写入和执行，历史仍可查询。具体退出记录、条件检查和后台任务属于生命周期能力的实现。
 
-| 接口组 | 函数 | 边界 |
+## 5. 谁暴露什么接口
+
+### 5.1 Memory 领域接口：对外服务能力
+
+**提供方是 Memory System，调用方是 Harness Core 或独立客户端。** 这里的接口按对象和能力划分，不预设一个能力对应多少个 RPC。
+
+| 能力边界 | 暴露的抽象对象 | 调用方表达的意图 | Memory 承诺的结果 |
+| --- | --- | --- | --- |
+| 会话管理 | Session | 创建、发现、选择、分叉或请求结束一段工作 | 可持久定位的工作边界与明确生命周期 |
+| 会话记录 | Session 的 History | 记录经历，读取某段历史或某个来源 | 已保存且可追溯的记录 |
+| 工作状态 | Session 的 Context | 保存当前工作状态，读取当前或历史状态 | 与 Session、来源相关联的版本化状态 |
+| 记忆使用 | 用户记忆条目及视图 | 查找有关知识、画像或近期材料，读取证据 | 带来源、适用条件和可信状态的材料 |
+| 记忆维护入口 | 记忆候选与纠正 | 提出值得保留的信息，纠正或停止使用旧知识 | 请求被记录，并进入相应验证或维护流程 |
+
+例如，“保存 Context”的契约是持久化工作状态，不是要求 Memory 应用 prompt；“创建 Session”的契约是创建逻辑对象，不是启动进程。
+
+### 5.2 执行协作接口：持久化运行协调
+
+Task 状态、待处理输入和通知由 Harness 定义业务语义。为了断线恢复和 Router/Worker 异步协作，当前部署方案由 Memory 服务额外提供**执行协作存储接口**。
+
+| 提供方 | 调用方 | 保存或查询的对象 | 领域边界 |
+| --- | --- | --- | --- |
+| Memory 服务的协作存储模块 | Harness 的 Dispatcher、Router、Worker Controller | task 状态、输入队列、结果通知、临时写入所有权 | 支持执行协调，不是用户知识或长期记忆 |
+
+这些信息可能与会话记录存在引用，也可能共用数据库，但调度仍由 Harness 完成。一次 lease 续租或心跳不是用户经历，不能自动进入知识检索。
+
+### 5.3 Harness 执行端口：系统内部调用
+
+Runtime Driver/Host Adapter 向 Harness Core 暴露进程分配、执行容器挂载、模型调用、工具调用和结果核对能力。提供方是运行环境或 Host 适配器，不是 Memory。
+
+这些端口属于 [Harness 设计](agent-harness.md)，不列入两系统的记忆领域契约。Host 原生会话定位也只是适配元数据，不定义逻辑 Session 的身份。
+
+### 5.4 Memory 内部维护能力
+
+Session Maintenance 管理退役；Memory Agent/Validator 管理知识提取与修订；保留和删除任务管理数据生命周期。它们是 Memory 的内部实现。
+
+Harness 可以提交维护意图，但不需要了解后台 job、事务、表结构或模型调用步骤。具体内部流程见 [Memory 设计](memory-system.md)。
+
+## 6. 用一个例子贯穿对象与接口
+
+用户请 Router 安排行程。用户对话属于 Router Session，旅行规划属于另一个工作 Session；两者都在该用户的统一 Memory 域内。
+
+| 阶段 | 持久对象发生的变化 | 使用的能力 |
 | --- | --- | --- |
-| Host Adapter 元数据 | linkHostSession / resolveHostSession | 保存原生会话定位关系，与执行权独立 |
-| 维护请求 | requestSessionReview | 将 session 加入后台维护队列，返回 job ID |
-| Memory 内部维护 | retireSession | 校验条件后原子保存退出记录并冻结 session；不在 Router 对话内执行 |
-| 记忆维护 | compactMemories / archiveMemory / deleteMemory | 由 Memory 维护任务按策略执行，不由 session 退役隐式触发删除 |
+| 收到请求 | 用户消息写入 Router 的 History，成为一次 Router turn 的输入；Core 追加到 Context 并选取有关用户记忆 | 会话记录、记忆使用、工作状态 |
+| 分派工作 | 创建旅行 Session，将任务要求与原始消息引用作为起点；持久保存 task 后，Router 可以回复并结束本 turn | 会话管理、会话记录、执行协作 |
+| 推进规划 | Worker 恢复旅行 Context；模型输出与工具观察记录到其 History，再由 Core 追加或 compact 到 Context 并保存新版本 | 会话记录、记忆使用、工作状态 |
+| 调整方案 | 新用户要求先进入 Router History；Router 通过任务输入交给 Worker，Worker 处理时记录来源并更新旅行 Context | 会话记录、执行协作、工作状态 |
+| 暂停后继续 | 另一 Worker 读取同一 Session 的 Context 与后续记录 | 会话管理、工作状态、会话记录 |
+| 向用户汇总 | Worker 保存结果；结果通知触发新的 Router turn，Router 读取结果，生成回复并保存自己的 History 与 Context | 执行协作、会话记录、工作状态 |
+| 沉淀知识 | 将有充分依据的可复用信息提议为记忆条目 | 记忆维护入口 |
+| 工作结束 | 释放执行占用；Session 可保留继续或由维护策略退役 | 执行协作、会话生命周期 |
 
-v0.6 中的 bindRuntime 改为定位语义明确的 linkHostSession，startRun 改为 claimSession。原 putContext / confirmContextLoaded / activateContext 流程收敛为 saveCheckpoint；本地准备输入及实际执行分别记录。这是对“当前版本”含义的简化，不把“已保存”误报为“已执行”。
+一次 turn 是 Harness 处理一条输入并推进模型交互的执行单位，不是新的 Memory 分区。它产生的消息先作为所属 Session 的 History 持久记录，再由 Core 纳入 Context；每次保存 Context 都形成新的工作状态版本。Worker 的最终结果触发新 turn，不作为旧分派调用的第二次返回。
 
-## 4. 数据结构
+“这次预算有限”是当前工作的临时约束，不应自动成为长期画像。如果用户明确要求“以后规划也尽量少换乘”，这可以作为长期偏好的候选，并保留原始要求作为来源。
 
-### 4.1 归属、引用与 session
+原始对话保留，不代表所有对话都属于长期记忆；Context 保存，不代表模型已经调用；Session 退役，不代表知识已经提取完成。三个事实由各自的对象和流程表达。
 
-```typescript
-type ID = string;
-type Timestamp = string;
-type JsonValue = null | boolean | number | string
-  | JsonValue[] | { [key: string]: JsonValue };
-interface UserDomain { userId: ID; }
+## 7. 细节文档的使用顺序
 
-type MemoryKind = "fact" | "preference" | "goal" | "procedure" | "episode" | "note";
-type MemoryHorizon = "short_term" | "long_term";
-type MemoryStatus = "active" | "superseded" | "archived" | "deleted";
-interface BlobRef { blobId: ID; sha256: string; mediaType: string; byteSize: number; }
-type Content = { type: "inline"; value: JsonValue } | { type: "blob"; ref: BlobRef };
-interface ContextRef { contextId: ID; versionId: ID; }
-type EvidenceRef = { kind: "event"; sessionId: ID; eventId: ID }
-  | { kind: "memory"; memoryId: ID; revision: number };
-type ReadGrant = { kind: "user" }
-  | { kind: "task"; taskId: ID; sessionIds: ID[]; refs: EvidenceRef[]; collectionIds: ID[] };
+先确认本文的对象关系与能力边界，再讨论实现参考中的函数、字段和传输协议：
 
-interface SessionCreate {
-  sessionId: ID;
-  role: "router" | "task";
-  purpose: string;
-  retention: "reusable" | "one_shot";
-  parentContext?: ContextRef;
-}
-interface SessionDescriptor extends SessionCreate {
-  domain: UserDomain;
-  streamId: ID;
-  contextId: ID;
-  lifecycle: "open" | "retired";
-  revision: number;
-  createdAt: Timestamp;
-  retiredAt?: Timestamp;
-}
-interface SessionState {
-  session: SessionDescriptor;
-  acceptedThrough: number;
-  head: CheckpointHead;
-  lease?: SessionLease;
-  pendingTaskIds: ID[];
-  queuedInputRefs: EvidenceRef[];
-  unresolvedActionIds: ID[];
-}
-interface SessionQuery { query?: string; lifecycle?: "open" | "retired"; cursor?: string; limit: number; }
-interface SessionPage {
-  items: { session: SessionDescriptor; head: CheckpointHead; summary: string; summarySource?: ContextRef; busy: boolean }[];
-  nextCursor?: string;
-}
-```
+- [接口实现参考](integration-reference.md)：候选 SDK/服务函数、载荷和 HTTP 映射；尚未冻结。
+- [Harness 内部设计](agent-harness.md)：执行 loop、Driver 和 Router/Worker 协作。
+- [Memory 内部设计](memory-system.md)：对象管理、维护、存储及一致性实现。
 
-fork 的 parentContext 是固定初始化来源，不是新 session 已执行的证明。新流序号从 1 起步，首个 checkpoint 使用新 contextId；未决工具执行权不随快照复制。retired session 可读不可写，需要时从固定历史创建分叉。
-
-### 4.2 写入租约与 Host 定位
-
-```typescript
-interface ClaimRequest {
-  runId: ID;
-  taskId?: ID;
-  executorId: ID;
-  expectedHeadRevision: number;
-  readGrant: ReadGrant;
-  ttlSeconds: number;
-}
-interface SessionLease {
-  sessionId: ID;
-  runId: ID;
-  executorId: ID;
-  epoch: number;
-  expiresAt: Timestamp;
-}
-interface SessionClaim { state: SessionState; lease: SessionLease; }
-interface ReleaseRequest {
-  outcome: "completed" | "paused" | "failed";
-  checkpoint?: ContextRef;
-  resultRefs: EvidenceRef[];
-}
-
-interface HostSessionKey { hostInstanceId: ID; nativeSessionId: string; nativeBranchId: string; }
-interface HostSessionLink {
-  sessionId: ID;
-  key: HostSessionKey;
-  host: "dsh" | "pi" | "other";
-  hostVersion: string;
-}
-```
-
-HostSessionKey 在用户域内唯一映射到逻辑 session。同一 session 可先后关联多个原生容器。SessionLease 控制写入；租约过期只说明失去写入权，不说明外部工具已经停止。
-
-### 4.3 事件、checkpoint 与模型输入
-
-```typescript
-interface ToolCall { toolCallId: ID; name: string; arguments: JsonValue; }
-interface Message {
-  messageId: ID;
-  speaker: "user" | "assistant" | "tool";
-  content: Content;
-  toolCalls?: ToolCall[];
-  inReplyToToolCallId?: ID;
-  completeness: "complete" | "interrupted";
-}
-interface RecordInput {
-  eventId: ID;
-  sequence: number;
-  originId: string;
-  producerRunId: ID;
-  actor: { kind: "user" | "router" | "worker" | "runtime"; id: ID };
-  kind: "message" | "turn_state" | "action_state" | "model_request_prepared"
-    | "task_update" | "task_input_applied" | "task_notification" | "observation" | "feedback";
-  turnId?: ID;                    // Worker 可以在原 Router turn 结束后继续
-  taskId?: ID;
-  stepId?: ID;
-  occurredAt: Timestamp;
-  payload: Content;
-  sourceRefs: EvidenceRef[];
-}
-interface AppendRequest { afterSequence: number; records: RecordInput[]; }
-interface AppendReceipt { acceptedThrough: number; userRevision: number; }
-interface EventPage { records: RecordInput[]; nextSequence: number; hasMore: boolean; }
-
-interface WorkingBlock {
-  id: ID;
-  category: "goal" | "constraint" | "memory" | "evidence" | "progress" | "message" | "tool_exchange";
-  content: Content;
-  sourceRefs: EvidenceRef[];
-  protected: boolean;
-}
-interface WorkingContext { format: "genvagent.context.v1"; goal: string; blocks: WorkingBlock[]; }
-
-interface ContextCheckpoint {
-  ref: ContextRef;
-  body: Content;
-  format: string;
-  bodyHash: string;
-  coveredEventSequence: number;
-  sourceRefs: EvidenceRef[];
-  recalledAtUserRevision: number;
-}
-interface CheckpointWrite { expectedHeadRevision: number; checkpoint: ContextCheckpoint; }
-interface CheckpointHead { contextId: ID; revision: number; latest?: ContextRef; }
-
-interface ModelInputRecord {
-  actionId: ID;
-  stepId: ID;
-  runId: ID;
-  checkpoint: ContextRef;
-  input: Content;
-  inputHash: string;
-  coverage: "working_view" | "model_messages" | "provider_payload";
-}
-```
-
-eventId 在用户域唯一，originId 在 session 内唯一；sequence 跨 run 连续。新执行者补传旧批次时沿用事件及 producerRunId，使用当前有效 lease 写入；旧结果不能冒充新执行。
-
-checkpoint 的 coveredEventSequence 表示工作投影已处理的位置，不代表全部排队输入、task 或工具都已完成。控制状态独立从记录和任务存储恢复。准备请求后发生新用户纠正或取消时，Core 校验输入位置，必要时重新准备。
-
-### 4.4 异步任务与进度
-
-```typescript
-type SessionTarget =
-  | { mode: "new"; sessionId: ID; retention: "reusable" | "one_shot" }
-  | { mode: "resume"; sessionId: ID; expectedHeadRevision: number }
-  | { mode: "fork"; sessionId: ID; parent: ContextRef; retention: "reusable" | "one_shot" };
-
-interface TaskDescriptor {
-  taskId: ID;
-  routerSessionId: ID;
-  originTurnId: ID;
-  goal: string;
-  constraints: string[];
-  target: SessionTarget;
-  inputRefs: EvidenceRef[];
-  readGrant: ReadGrant;
-  maxSteps: number;
-}
-type TaskStatus = "queued" | "running" | "waiting_input" | "completed" | "failed" | "canceled";
-interface TaskAccepted { taskId: ID; sessionId: ID; status: "queued"; }
-
-interface TaskUpdate {
-  taskId: ID;
-  status: TaskStatus;
-  phase: string;
-  summary: string;
-  completedSteps: number;
-  checkpoint?: ContextRef;
-  resultRefs: EvidenceRef[];
-}
-interface TaskSnapshot extends TaskUpdate {
-  revision: number;
-  sessionId: ID;
-  runId?: ID;
-  updatedAt: Timestamp;
-  pendingInputIds: ID[];
-  activity?: { lastSeenAt: Timestamp; leaseExpiresAt?: Timestamp; claimState: "claimed" | "released" | "expired" };
-}
-interface TaskInput {
-  inputId: ID;
-  taskId: ID;
-  kind: "message" | "cancel";
-  content: Content;
-  sourceRefs: EvidenceRef[];
-}
-interface TaskNotification {
-  notificationId: ID;
-  routerSessionId: ID;
-  taskId: ID;
-  originTurnId: ID;
-  taskRevision: number;
-  kind: "waiting_input" | "completed" | "failed" | "canceled";
-  sourceRefs: EvidenceRef[];
-  deliveredEventId?: ID;
-}
-```
-
-recordTask 检查目标开放，并与 pendingTask 索引一起提交。重复 taskId 返回原接受结果；不同内容不能静默覆盖。Worker 的 TaskUpdate 由其当前 task/run 授权约束；普通变化不直接改变 Router context。
-
-task_input_applied 在保存实际输入处理事件时确认 inputId，不能读到就先确认。task_notification 追加到目标 Router 流时，在同一事务设置 deliveredEventId，重复通知不产生重复 turn。通知触发的 turn 使用稳定通知 ID 创建。
-
-completed 和正常 waiting_input 需要已保存 checkpoint；异常失败可以只有最后已确认状态。TaskSnapshot 的状态与 lease 活性分别呈现，心跳丢失不直接推导业务失败。
-
-### 4.5 查询、记忆与维护
-
-```typescript
-interface UserOverview {
-  userRevision: number;
-  entries: { kind: "memory" | "collection" | "session" | "task"; id: ID; label: string; summary?: string; sourceRefs: EvidenceRef[] }[];
-  nextCursor?: string;
-}
-interface ProfileView {
-  readUserRevision: number;
-  claims: { key: string; text: string; refs: EvidenceRef[]; status: "supported" | "inferred" | "disputed"; validUntil?: Timestamp }[];
-}
-interface RecallRequest {
-  runId: ID;
-  query: string;
-  corpora: ("memories" | "session_events" | "user_events")[];
-  horizons?: MemoryHorizon[];
-  labels?: string[];
-  collectionIds?: ID[];
-  requiredRefs: EvidenceRef[];
-  minUserRevision?: number;
-  maxItems: number;
-  maxBytes: number;
-}
-interface RecallItem {
-  ref: EvidenceRef;
-  text: string;
-  sourceRefs: EvidenceRef[];
-  epistemicStatus: "supported" | "inferred" | "unverified" | "disputed";
-  stale: boolean;
-  memoryStatus?: MemoryStatus;
-  validUntil?: Timestamp;
-}
-interface RecallResponse { readUserRevision: number; items: RecallItem[]; missingRequiredRefs: EvidenceRef[]; }
-interface MemoryProposal {
-  proposalId: ID;
-  producerRunId: ID;
-  memoryId?: ID;
-  expectedRevision?: number;
-  kind: MemoryKind;
-  horizon: MemoryHorizon;
-  content: Content;
-  labels: string[];
-  collectionIds: ID[];
-  applicability: string[];
-  sourceRefs: EvidenceRef[];
-}
-interface FeedbackInput { feedbackId: ID; sourceEvent: EvidenceRef; target: EvidenceRef; kind: "correction" | "stale" | "useful" | "rejected"; }
-
-interface SessionExitRecord {
-  sessionId: ID;
-  reason: string;
-  summary: string;
-  checkpoint?: ContextRef;
-  eventThrough: number;
-  sourceRefs: EvidenceRef[];
-  successorSessionId?: ID;
-}
-interface RetireRequest {
-  expectedSessionRevision: number;
-  expectedHeadRevision: number;
-  expectedAcceptedThrough: number;
-  exitRecord: SessionExitRecord;
-}
-interface ServerCapabilities {
-  protocolMajor: number;
-  protocolMinor: number;
-  contextFormats: string[];
-  maxInlineBytes: number;
-  maxBatchEvents: number;
-}
-```
-
-画像、集合和检索都受 user/run 授权过滤。分类可为空；requiredRefs 精确读取。记忆提案持久化不等于知识已验证。SessionExitRecord 与可选的长期 note 分开，退役不等待知识提取成功。
-
-## 5. 一次具体调用示例
-
-Worker P2 继续 session-trip，当前 checkpoint 为 v8，已覆盖事件 40：
-
-1. Harness 分配 P2，调用 claimSession，Memory 返回新 epoch 的 SessionLease。
-2. Harness 读取 v8 和 40 之后的事件；Driver 恢复本地工作副本。
-3. 新输入 e-41 通过 appendEvents 保存；appendMessages 合入工作视图。
-4. Harness 调用 saveCheckpoint，提交覆盖至 41 的 v9。Memory 保存 v9 并把最新指针推进到 v9。
-5. Driver 准备请求，Core 保存引用 v9 的 ModelInputRecord，然后才调用模型。
-6. 模型输出和工具结果继续追加；任务阶段更新形成 TaskSnapshot，重要状态产生通知。
-
-步骤 4 成功、步骤 5 尚未执行时，Memory 只确认“v9 已保存”；模型是否调用由请求与结果记录另行核对。保存快照与执行请求分别提交。
-
-```json
-{
-  "expectedHeadRevision": 8,
-  "checkpoint": {
-    "ref": {
-      "contextId": "context-trip",
-      "versionId": "v9"
-    },
-    "body": {
-      "type": "inline",
-      "value": {
-        "format": "genvagent.context.v1",
-        "goal": "继续行程规划",
-        "blocks": [
-          {
-            "id": "progress-40",
-            "category": "progress",
-            "content": {
-              "type": "inline",
-              "value": "此前已收集候选行程，尚待确认最终方案。"
-            },
-            "sourceRefs": [
-              {
-                "kind": "event",
-                "sessionId": "session-trip",
-                "eventId": "e-40"
-              }
-            ],
-            "protected": false
-          },
-          {
-            "id": "message-41",
-            "category": "message",
-            "content": {
-              "type": "inline",
-              "value": {
-                "messageId": "m-41",
-                "speaker": "user",
-                "content": {
-                  "type": "inline",
-                  "value": "继续之前的行程，尽量减少换乘。"
-                },
-                "completeness": "complete"
-              }
-            },
-            "sourceRefs": [
-              {
-                "kind": "event",
-                "sessionId": "session-trip",
-                "eventId": "e-41"
-              }
-            ],
-            "protected": true
-          }
-        ]
-      }
-    },
-    "format": "genvagent.context.v1",
-    "bodyHash": "sha256:<64-hex-digits>",
-    "coveredEventSequence": 41,
-    "sourceRefs": [
-      {
-        "kind": "event",
-        "sessionId": "session-trip",
-        "eventId": "e-40"
-      },
-      {
-        "kind": "event",
-        "sessionId": "session-trip",
-        "eventId": "e-41"
-      }
-    ],
-    "recalledAtUserRevision": 208
-  }
-}
-```
-
-示例假设 e-40 保存此前的工作摘要，e-41 是新的用户请求；正文同时保留两者及来源。bodyHash 为占位值，实际请求使用正文的真实规范化摘要。
-
-## 6. HTTP 映射与可靠性
-
-域前缀 P 为 `/v1/users/{userId}`。服务端核对认证或委托身份。写操作带 Idempotency-Key；执行相关写入还携带 run ID 与 epoch。
-
-| 函数组 | HTTP |
-| --- | --- |
-| create/get/discover session | POST P/sessions；GET P/sessions/{id}；POST P/sessions:search |
-| claim/renew/release | POST P/sessions/{id}:claim；POST P/sessions/{id}:renew；POST P/sessions/{id}:release |
-| append/read events | POST P/sessions/{id}/events:append；GET P/sessions/{id}/events |
-| save/read checkpoint | POST P/sessions/{id}/checkpoints；GET P/contexts/{contextId}/versions/{versionId} |
-| record/get/list task | PUT P/tasks/{taskId}；GET P/tasks/{taskId}；GET P/tasks?status=... |
-| task input | POST / GET P/tasks/{taskId}/inputs |
-| notifications | GET P/sessions/{routerSessionId}/task-notifications |
-| Host 定位 | POST P/host-session-links；POST P/host-session-links:resolve |
-| overview/profile/recall | GET P/overview；GET P/profile；POST P/recall |
-| 原文与记忆 | GET P/sessions/{sessionId}/events/{eventId}；GET P/memories/{memoryId}?revision=... |
-| 提案/反馈/变更 | POST P/memory-proposals；POST P/feedback；GET P/changes |
-| 维护请求 | POST P/sessions/{id}/maintenance-requests |
-| 大正文 | POST P/blobs；GET P/blobs/{blobId} |
-
-retireSession 是 Memory 内部维护提交操作，不作为 Harness 在线执行所必需的 RPC。查询、定位和 search 不改变执行状态。
-
-保存 checkpoint 与执行动作不跨服务做原子事务。原始事件先持久化、checkpoint 条件提交、请求输入单独记录，恢复时分别核对。请求记录仅证明已准备或请求过，不证明外部动作成功；未知结果通过 reconcile 处理。
-
-JSON 正文使用 RFC 8785 JCS 规范化后计算 SHA-256；blob 对原始字节计算。序号、revision、epoch 使用非负安全整数，拒绝重复属性和非有限数值。[JCS 规范](https://www.rfc-editor.org/rfc/rfc8785)
-
-| 故障或竞争 | 处理 |
-| --- | --- |
-| 消息已存，checkpoint 未保存 | 从旧快照重放增量 |
-| checkpoint 已存，请求未发出 | 准备输入，先核对 action 记录再执行 |
-| 请求可能发出，结果未知 | 核对运行环境，不盲目重放工具 |
-| Router 离线或通知重复 | 保留通知，按稳定 ID 幂等追加到 Router 流 |
-| 旧 Worker 恢复写入 | 拒绝旧 epoch，现任执行者核对其未确认记录 |
-| 新任务/写入权与退役竞争 | 事务锁与版本检查只允许合法的一方提交 |
-| 索引未达 minUserRevision | 补读权威数据或返回 NOT_READY |
-
-strict 模式在持久化或 lease 不可用时暂停新步骤。第一版以此为默认保证；本地离线执行作为后续显式选项，不静默改变保证。删除、授权撤回对历史快照和派生视图同样生效。
-
-错误返回 code、message、retryable、requestId，区分版本/序号冲突、session 忙碌、已退役、未决动作、lease 丢失、来源删除与服务不可用。通知和 changes 至少一次交付，不把网络超时视为服务端撤销。
-
-## 7. 验收重点
-
-1. Worker 运行期间，Router 可以完成新的用户输入、任务状态查询和取消请求。
-2. delegate 立即返回持久接收结果；Worker 最终输出通过新的通知 turn 汇总。
-3. TaskSnapshot 可追溯到 Worker 事件与 checkpoint，心跳不触发大量 Router 调用。
-4. 新进程继续旧 session，原始消息与 context 增量不丢失；保存状态不被误报为已执行。
-5. 第一版只需 append + compact，无 CLM 编辑依赖。
-6. 后台维护主动处理 one_shot 和闲置候选；有未决工作时不能退役。
-7. 退役必须保存 exit record，长期 note 可选；notes compact、归档和删除各自遵循独立语义。
+第一版的行为约束保持不变：统一用户 Memory，Router 不阻塞等待 Worker，Worker 可替换，context 使用 append + compact，Memory 可独立部署。CLM 与资源虚拟化仍是后续扩展。
