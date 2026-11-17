@@ -1,137 +1,205 @@
-# Genvagent：用户统一 Memory 与 Router/Worker Harness
+# Genvagent：统一用户记忆与可恢复的 Agent 执行
 
-状态：设计草案 v0.5；2026-11-17。当前仓库仅包含设计文档。
+状态：设计草案 v0.6；2026-11-17。当前仓库仅包含设计文档。
 
-Genvagent 包含两个系统：**Agent Harness** 负责用户对话、Router/Worker 执行与工作上下文；**Memory System** 按 user 聚合全部持久信息，独立部署于单机或集群。project notes 属于用户 Memory 内的专题资料。
+Genvagent 包含两个系统：**Agent Harness** 管理 Router、任务路由、执行循环和工作上下文；**Memory System** 按 user 保存证据、可复用记忆及持久执行状态，独立部署于单机或集群。系统不要求用户有项目，也不限定为编程场景。
 
-## 1. 使用模型
+## 1. 用户记忆的概念模型
 
-用户只与 Router 对话。Router 可以读取该用户的长期目标、偏好、历史会话和所有项目 notes，根据当前对话决定直接答复或分派 Worker。Worker 执行具体任务，结果回到 Router，由 Router 对用户负责。
+**User Memory 是一个用户的完整记忆域。** 画像、短期记忆、长期记忆和 notes 都在其中，但它们描述的是不同维度，不能作为互斥的同级存储分类。
 
-Router 的完整访问能力通过用户概览、跨项目检索与精确来源读取实现；每次模型调用仍只装入当前任务需要的材料。Worker 获得目标、约束、相关证据与项目资料，并维护独立 context。
+### 1.1 持久对象与派生视图
 
-| 概念 | 归属与关系 |
-| --- | --- |
-| User Memory | userId 对应的统一记忆域；不随项目、Host 或进程切换而改变 |
-| User notes | 用户级偏好、目标和通用知识 |
-| Project notes | 用户域内带 projectId 的知识；保留项目适用条件 |
-| Router conversation | 用户持续对话，可在多个项目间切换 |
-| Turn | 从一个用户输入到答复、澄清、失败或取消；可以包含多个 agent step |
-| Worker task | Router 分派的具体工作，使用独立 session、记录流与 context |
+```text
+User Memory
+  原始证据
+    用户输入、模型输出、工具结果、外部材料及来源
+  可复用记忆条目
+    事实、偏好、目标、方法、经历、notes
+    每条保留适用条件、时效、证据与修订
+  持久执行状态
+    sessions、context 版本、任务与执行记录
 
-第一版不引入跨用户团队知识库。同名项目在不同用户下分别保存；同用户跨项目引用是正常能力。
+基于上述对象形成的视图
+  用户画像：有关用户特征、偏好、目标与约束的记忆及来源
+  短期记忆：近期对话、当前目标、待办、未决问题与进行中的 session
+  长期记忆：经过整理、可跨会话复用的事实、经验、偏好与 notes
+  可选集合：按用户需要组织的主题、活动、领域或项目资料
+```
 
-## 2. 两大系统的关系
+| 维度 | 回答的问题 | 设计含义 |
+| --- | --- | --- |
+| 用户归属 | 信息属于谁 | userId 是唯一记忆域；不因活动或工具切换而变化 |
+| 时间与用途 | 当前需要，还是长期复用 | 短期/长期是生命周期与使用特征；短期信息也可以持久化 |
+| 内容语义 | 记住的是什么 | 事实、偏好、目标、方法、经历等 |
+| 表达形式 | 如何组织内容 | note 是带来源的整理文本；可以是短期或长期信息 |
+| 组织方式 | 如何分组与发现 | 标签与集合可选；旅行、学习或软件项目只是例子 |
+
+用户画像是带证据、时效和不确定性的视图，不维护一份脱离来源的“用户真相”。例如“这次旅行预算有限”先是当前任务约束，不能直接变成用户永久偏好。长期记忆也会失效、被纠正或退役。
+
+工作 context 是某个 session 当前使用的工作视图，通常承载当前目标和短期执行状态，但不等于用户的全部短期记忆。多个 session 可以同时持有不同目标；Router 按需读取它们及可复用记忆。
+
+集合可以不存在。一条 note 不必属于集合，也可关联多个集合；project notes 只是一种可选的资料组织方式，不进入系统的核心类型划分。第一版仍以单用户记忆域为边界，不设计跨用户团队知识库。
+
+## 2. Process、Session、Context 与 Task
+
+用户只与 Router 对话。Router 使用自己的持久 session/context 理解请求，选择直接处理、创建新的任务 session，或继续已有 session。实际工作由可替换的 Worker 进程执行。
+
+| 概念 | 含义 | 是否跨进程保留 |
+| --- | --- | --- |
+| Worker process | 执行模型和工具的 agent 进程，加载本次被分配的状态 | 不作为业务记忆的权威来源，可释放或替换 |
+| Session | 持久的逻辑工作线程；关联记录流、context 版本和任务历史 | 是，由 Memory 保存，具有稳定 sessionId |
+| Context | Session 的工作状态，包括目标、约束、证据、进度和消息视图 | 是，以不可变版本及当前指针保存 |
+| Task | 一次要完成的工作；Router 决定在哪个 session 上执行 | 是，独立于进程与 context 的寿命 |
+| Run | 某进程在某 session 上的一次执行尝试，受 lease 约束 | 执行记录保留，运行占用可结束 |
+| Runtime binding | dsh/pi 原生 session 与逻辑 session 的适配映射 | 可保留用于定位；不定义逻辑 session 的身份 |
+
+第一版一个逻辑 session 对应一个记录流和一条 context 版本序列。同一 session 可以先后执行多个 task；一个 task 重试或换进程时可以产生多个 run。并行探索使用独立 session 或分叉，不允许两个进程同时写同一个 session。
+
+```text
+task A ── run 1 / process P1 ──┐
+                             ├── session S ── context C: v1 → v2 → v3
+task B ── run 2 / process P2 ──┘
+
+process P1 也可以在释放后执行另一个 session。
+进程替换不创建新的业务 context；选择新目标或分叉才创建。
+```
+
+“Worker 无状态”指它不独占跨执行的业务状态，不是执行期间没有内存、工具句柄或文件。进程退出后，业务状态从 Memory 恢复；外部工具、工作区和操作系统进程仍需运行时核对。
+
+## 3. Router 的路由与上下文管理
+
+### 3.1 路由对象是 session/context
+
+Router 先读取用户画像摘要、当前对话、有关记忆和 session 目录，再决定任务去向。它选择的是工作状态及执行策略，进程由运行时按能力分配。
+
+| 路由结果 | 使用条件 | 对持久状态的操作 |
+| --- | --- | --- |
+| 直接处理 | 当前 Router context 足以完成请求 | 继续 Router session，无须创建 Worker |
+| 新建 | 独立问题、无合适历史状态，或需要隔离干扰 | 创建 session/context，以任务目标和选定证据初始化 |
+| 继续 | 已有 session 的目标、进度和执行环境仍适用 | 取得原 session 的写入 lease，加载当前 context 与增量 |
+| 分叉 | 从既有进度探索另一方案，或需要并行执行 | 从固定 ContextRef 创建新 session/context，记录来源 |
+| 等待或澄清 | 目标不明确、session 正忙或外部动作未决 | 保留请求，不抢占已有执行或猜测工具结果 |
+
+继续既有 session 不要求找到原来的 Worker。Router 依据 session 摘要发现候选，再精确读取状态；开始执行时校验版本、生命周期、授权和未完成动作，不能仅凭语义相似度恢复。
+
+### 3.2 CLM 在 Router 中的作用
+
+CLM 将当前上下文作为模型可编辑的对象，编辑结果进入后续模型输入，并扩展到多上下文协作。[原论文](https://arxiv.org/html/2609.37725v1)、[官方实现](https://github.com/facebookresearch/context-language-models)
+
+本项目据此提出以下 Router 设计；这是待验证的应用方案：
+
+- Router 可检查、改写自己的工作 context，维护当前意图、重要约束、候选 session、证据缺口和任务进展。
+- Router 可按引用读取其他 session 的摘要或固定快照，决定继续、分叉或新建，再组织目标 session 的初始输入。
+- 检索先补充证据，context 编辑再决定哪些信息实际进入下一轮；不是把全部记忆一直追加到 prompt。
+- Core 负责来源、版本、工具交换与受保护约束校验。Router 不能通过编辑一份摘要直接改写被另一 Worker 占用的 context。
+
+第一版将可编辑内容暴露为 context 工具；可选文件视图只是同一对象的编辑入口。修改必须通过保存、应用和确认，才能影响下一次调用。CLM 不代替 session 目录、并发控制或原始证据存储。
+
+质量评估比较固定摘要策略与 CLM Router，在相同模型和预算下测试：任务分派是否正确、旧 session 是否选对、关键约束是否保留、无关历史是否干扰，以及延迟和 token 成本。论文结果不直接证明本系统的路由质量已提高。
+
+## 4. 两大系统与执行 loop
 
 ```mermaid
 flowchart TB
     U[User] --> R
-    subgraph H["Genvagent Agent Harness"]
-        subgraph C["Harness Core"]
-            R[Router / Turn Controller]
-            L[Agent Controller / logical loop]
-            T[Task Controller / Worker sessions]
-            X[Context Controller]
-            S[Memory Coordinator]
-            R --> L
-            L <--> T
-            L <--> X
-            X --> S
-            T --> S
-        end
+    subgraph H["Agent Harness"]
+        R[Router / Turn Controller]
+        L[Agent Controller / logical loop]
+        S[Session / Task Controller]
+        C[Context Controller]
+        MC[Memory Coordinator]
         D[Runtime Driver / Host Adapter]
+        W[可替换的 Worker processes]
+        R --> L
+        L <--> S
+        L <--> C
+        S --> MC
+        C --> MC
         L <--> D
+        D <--> W
     end
-    D <--> HOST[模型与工具运行环境：独立 Driver / dsh / pi]
-    S --> API
-    subgraph M["独立 Memory System"]
-        API[Memory API]
-        DATA[(用户事件 / context / notes)]
-        FIND[Overview / Retrieval]
-        DREAM[Memory Agent / Validator]
-        API --> DATA
-        API --> FIND
-        DATA --> DREAM
-        DREAM --> DATA
-        FIND --> DATA
+    MC --> A
+    subgraph M["Memory System"]
+        A[API / Session Registry]
+        E[(用户证据 / 记忆条目 / session 与 context)]
+        Q[Profile / Recall / Session Discovery]
+        B[Memory Agent / Validator]
+        A --> E
+        A --> Q
+        Q --> E
+        E <--> B
     end
 ```
 
-**Host** 指 dsh、pi 这样的完整 agent 应用。Genvagent 以 Adapter 接入其扩展点；Host 提供底层模型调用、工具执行、界面、权限与工作环境。
+Harness Core 包含 Turn Controller、Agent Controller、Router Policy、Session/Task Controller、Context Controller 和 Memory Coordinator。Core 拥有逻辑 loop：接收输入、决定下一动作、提交 context、处理结果和结束执行。
 
-**Harness Core 拥有逻辑 agent loop。** 它接收输入、提交上下文、决定下一动作、处理工具与任务结果、结束 turn。模型 SDK 和工具进程属于 Runtime Driver；这种划分使同一 Core 可以独立运行，也可以由 Host 回调驱动。
+**Host** 是 dsh、pi 等完整 agent 应用。Runtime Driver/Host Adapter 提供模型调用、工具、权限、进程及原生会话适配。Core-owned 模式由 Runner 推进 Core；Host-driven 模式由安全边界的回调推进 Core，并由 Host 执行被允许的下一步。一个 run 只使用一种驱动方式。
 
-## 3. Core 与 loop 的边界
+Host 原生 session 是执行容器，逻辑 session 是持久工作身份。新的运行容器可以显式挂载已有逻辑 session，但需验证格式和外部执行环境兼容性。仅支持检索注入的 Adapter 不宣称具备完整上下文恢复能力。
 
-Core 内包含 Turn Controller、Agent Controller、Router Policy、Task Controller、Context Controller 和 Memory Coordinator。Router 与 Worker 共用 step 状态机，分别持有自己的执行状态和上下文。
+## 5. 每轮执行与 context 生命周期
 
-| 驱动方式 | Core 的职责 | Runtime 的职责 |
-| --- | --- | --- |
-| Core-owned | Runner 调用 advance，驱动完整逻辑循环 | 按动作调用模型/工具并回传结果 |
-| Host-driven | Adapter 在 Host 安全边界调用 advance，Core 决定允许的下一步 | Host 原生 loop 执行该步骤并发出完成事件 |
-
-一个 session 只使用一种驱动方式。Host-driven 的底层调用栈可以仍由 Host 持有，但不能由 Host 和 Core Runner 同时发起下一模型调用。无法接入请求 gate、上下文应用和结果关联的 Adapter 仅提供 Sync/Recall，不宣称实现完整编排。
-
-这一区分既明确 Core 的执行责任，也保留集成 dsh、pi 的插件路径。详细函数与状态机见[Harness Core](agent-harness.md)。
-
-## 4. 每轮对话的数据流
+### 5.1 执行顺序
 
 ```text
-用户输入
-  → Core 创建 turn，追加原始事件到 Memory
-  → 将已提交 Message 追加到 Router 工作 context
-  → 检索用户 Memory，保存并应用 context 版本
-  → Router 模型 step
-      → 直接答复
-      → 或创建 Worker task，执行多个 Worker step，再回传结果
-  → 追加 Router 的最终消息
-  → 保存最终 context checkpoint
-  → 追加引用 checkpoint 的 turn 终态
-  → 对用户标记本轮完成
+用户输入 → 持久化消息 → 更新 Router context → Router 决策
+  ├─ 直接回答
+  └─ 选择 new / resume / fork
+       → 确定持久 session/context
+       → 分配 Worker process，建立 run 并获取 session lease
+       → 加载 context 与未覆盖事件，核对未完成动作
+       → 按需检索，追加或编辑 context，提交版本
+       → 执行模型与工具，持续保存消息和进度
+       → 保存结果与最终 checkpoint，结束 run，释放进程占用
+       → 结果送回 Router，附 task / session / run / context 引用
+  → Router 汇总答复，保存 checkpoint 与 turn 终态
 ```
 
-事件追加与 context 更新是两个操作。事件流保存原始来源；context 是 Core 构建的输入工作视图，允许选择和压缩。每条完成消息及时保存，在下一模型请求前和 turn 结束前提交 context checkpoint。
+每条完成消息先通过 appendEvents 保存原始事件，再由 appendMessages 更新工作副本。下一模型调用前以及 run/turn 正常结束前提交 checkpoint。进程突然退出时，从最后已确认版本和后续事件恢复。
 
-Memory Agent 独立整理 user/project notes，发布修订；Harness 在后续请求边界读取。后台整理不直接改写活动 context。
+例如用户之前规划了一次旅行，session S 保存了预算、候选方案和未决问题。今天用户说“继续之前的行程”，Router 可以让新进程 P2 继续 S；如果用户要比较另一套方案，则从 S 的固定版本分叉 S2。用户另问一个无关问题时可以新建 S3，S 不因此被删除或退役。
 
-## 5. 状态责任与持久化
+### 5.2 创建、继续与退役
 
-| 状态 | 更新责任 | 持久化与恢复依据 |
+| 情况 | Session / context 的处理 |
+| --- | --- |
+| 首次独立工作 | 新建 session、空 context 序列，写入目标与授权证据后生成首个版本 |
+| 同一工作继续 | 沿用 sessionId/contextId，在已有记录和版本上追加新进度 |
+| 并行或替代方案 | 从明确版本分叉；新流从自己的序号起步，原 session 不变 |
+| 普通追加或 CLM 编辑 | 在同一个 contextId 下生成新版本；旧版本保留可追溯引用 |
+| 一次 task 完成或进程释放 | run 结束，session 默认保持 open 且空闲，可继续使用 |
+| 一次性工作无需继续 | 结果与 checkpoint 已保存、没有未决动作后，按策略退役 |
+| 状态已被新 session 替代或长期无用 | 保留最终摘要、来源和替代关系后退役；空闲时长仅作为候选条件 |
+| 已退役工作重新需要 | 读取历史作为证据，或从固定版本分叉；不直接向退役 session 写入 |
+
+**Session 的持久生命周期为 open / retired；是否正在执行由有效 run/lease 决定。** 进程退出、工具暂时不可用、task 完成和 context 压缩都不自动等于退役。
+
+退役冻结该 session 的继续执行能力，不删除记录、版本或长期记忆。变更必须检查 session revision、context head、最后接收位置、排队输入、未完成任务及未决动作，防止与新执行竞争。未完成工作须先明确取消或转交并保存结果，不能因没有活动进程就视为结束。物理删除由独立保留与删除策略处理。
+
+旧 context 版本被新版本取代，与整条 context/session 退役是两回事。短期内容是否提炼为长期记忆，也不由进程或 session 是否退役决定。
+
+## 6. 状态责任与存储边界
+
+| 状态 | 更新责任 | 持久化依据 |
 | --- | --- | --- |
-| turn、step、task、动作与结果 | Harness Core | Memory 事件流为恢复依据，本地索引用于加速 |
-| 原始消息与工具交换 | Core 规范化，Runtime 提供结果 | Memory records/blobs；Host 原生存档用于同步核对 |
-| 工作 context 及其已处理位置 | Context Controller | Memory 不可变版本与 ContextHead |
-| context 是否已应用 | Runtime Driver / Host Adapter | 本地持久 marker 与 Memory application receipt |
-| 用户与项目 notes | Memory Agent / Validator | NoteRevision、来源、适用条件与失效状态 |
-| 安装身份、会话映射、待发送批次 | Memory Coordinator | 插件/Runner 的本地 stateDir |
-| 文件、worktree、工具运行进程 | Runtime / Host | 实际工作区、执行日志和工具回执 |
-| 模型配置、工具定义、权限及凭据 | Runtime / Host | 运行环境配置与凭据存储；凭据不进入 Memory |
+| session 身份、生命周期及 context 关联 | Core 决策，Memory 校验提交 | Session Registry 与版本指针 |
+| turn、task、run、动作及结果 | Harness Core | Memory 事件与执行记录 |
+| 工作 context、约束及进度 | Router/Worker 经 Context Controller 编辑 | 不可变版本、来源与消费位置 |
+| context 在某进程中已加载和应用 | Driver / Adapter | 带 run/epoch 的应用 receipt 与本地 marker |
+| 事实、偏好、经历和 notes | Memory Agent / Validator | MemoryItemRevision 与失效状态 |
+| 用户画像、短期/长期视图、集合目录 | Memory 查询与整理模块 | 基于条目、session 与来源派生，可重建 |
+| 未确认批次、事件映射与原生关联 | Memory Coordinator | 本地持久日志，用于可靠投递与核对 |
+| 工具外部状态、文件、运行进程及凭据 | Runtime / Host | 执行环境与其恢复机制；凭据不进入 Memory |
 
-恢复 agent 的逻辑进度与恢复外部工具状态分别处理。上下文持久化不能证明工具已执行成功，恢复记录也不能触发重复外部操作。Host 存档路径与格式由 Adapter 解释，不假设所有 Host 具有相同实现。
+context 已保存不能证明外部动作成功。替换 Worker 后，未决动作必须先核对；不能通过加载旧快照重放未知结果的工具调用。
 
-## 6. 文档顺序与交付
+## 7. 文档与实施顺序
 
-1. [交互逻辑、接口函数与数据结构](integration-protocol.md)：先阅读每轮执行，再查看两侧调用与存储对象。
-2. [Agent Harness](agent-harness.md)：Core 模块、loop、Runtime 端口及 dsh/pi 适配。
-3. [Memory System](memory-system.md)：用户域、内部服务函数、notes 与独立部署。
+1. [交互逻辑与接口](integration-protocol.md)：new/resume/fork、执行附着、消息保存、context 提交和退役。
+2. [Agent Harness](agent-harness.md)：Router 的 CLM 策略、Session/Task Controller、进程端口和 Host 接入。
+3. [Memory System](memory-system.md)：记忆对象及视图、持久 session/context、检索、整理与部署。
 
-第一版以 Core 状态机和参考 Driver 验证 Router → Worker → Router 的完整流程，再将同一契约映射到 dsh/pi。Memory 首先实现事件、context 和关键词检索，随后加入有预算的后台整理与预备 notes。
+第一版优先验证：无集合用户的普通问答、无状态进程执行新任务、替换进程继续旧 session、分叉不污染原状态、退役后的只读查询，以及 CLM 编辑确实改变下一请求输入。其后验证 dsh/pi Adapter 与后台整理。
 
-不引入新的通用分布式任务平台、跨地域强一致服务或完整知识图谱。单机与集群共用 Memory 协议；Harness 不导入 Memory 内部数据库结构，Memory 不导入 Host SDK。
-
-计划仓库结构：
-
-```text
-Genvagent/
-  docs/
-  packages/
-    protocol/                    # 公共函数契约与类型
-    memory-client/               # 用户域客户端、幂等与重试
-    harness-core/                # turn / step / task / context 逻辑
-    runtime-driver/              # Core-owned 参考 Driver
-    adapter-dsh/                 # Host-driven 接入
-    adapter-pi/
-  services/
-    memory/                      # API、存储、检索、后台 Worker
-  evals/                         # 两侧独立与联合契约验证
-```
+实现包仍保持 protocol、memory-client、harness-core、runtime-driver、adapter-dsh、adapter-pi 和独立 memory service；不额外引入通用分布式任务平台。

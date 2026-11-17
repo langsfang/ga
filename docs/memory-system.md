@@ -1,179 +1,207 @@
-# Memory System：用户域、服务接口与后台整理
+# Memory System：用户记忆、持久执行状态与整理服务
 
-状态：设计草案 v0.5；2026-11-17。共享函数与协议类型见[交互逻辑与接口](integration-protocol.md)。
+状态：设计草案 v0.6；2026-11-17。对外函数与共享类型见[交互协议](integration-protocol.md)。
 
-## 1. 逻辑模型与边界
+## 1. 记忆对象与视图
 
-Memory System 以 **userId** 为唯一 Memory 归属域。一个用户的 Router 对话、Worker 记录、工作上下文、长期偏好和所有 project notes 均进入同一域，服务独立部署于单机或集群。
+Memory 以 userId 为唯一归属域，面向普通问答、学习、生活事务和工作等场景。项目、主题集合和固定画像字段都不是使用前提。
 
-projectId 表示用户域内的主题与任务分类。Router 可以跨项目检索并发现全部用户资料；无需先选择一个 project 才能打开 Memory。同名 project 不会把不同用户的数据合并。
+### 1.1 三类持久对象
 
-| 数据类别 | 用途 | 写入责任 |
+| 对象 | 保存内容 | 主要写入方 |
 | --- | --- | --- |
-| 原始事件与 Message | 记录用户输入、agent 输出、工具交换、任务与执行状态 | Harness Core 经 appendEvents 写入 |
-| 工作上下文版本 | 保存某个 Router/Worker 的输入工作视图与消费位置 | Core 构建，经 putContext / activateContext 提交 |
-| user notes | 用户级偏好、目标、跨任务适用的方法 | Router 提议或 Memory Agent 整理，Memory 验证发布 |
-| project notes | 某个项目的约束、决策、状态与方法 | 项目 Worker/Router 提议或 Memory Agent 整理 |
-| 用户概览与检索索引 | 发现项目、会话、任务及相关材料 | 从已提交对象派生，可以重建 |
+| 原始证据 | 用户消息、模型输出、工具结果、外部材料与执行事件 | Harness Core |
+| 记忆条目 | 带来源的事实、偏好、目标、方法、经历和 notes | 提案者 + Memory Validator |
+| 持久执行状态 | session、context 版本、task/run 记录、租约与生命周期 | Core 发起，Memory 条件提交 |
 
-Memory 保存事件时不调用 Router，也不自动把事件追加到活动 context。Memory Agent 整理长期知识；Context Controller 属于 Harness，决定下一模型请求的上下文。
+证据证明某次陈述或观察发生，不自动证明其内容正确。记忆条目保留适用条件、时间与修订；session/context 则保存尚在使用的工作状态。Worker process 不是存储分区。
 
-Memory Agent 使用服务自己的模型客户端与任务预算，Host 离线时仍可运行。Memory 不控制 Worker 的工具，不决定用户 turn 何时结束。
+### 1.2 画像、短期、长期与 notes
 
-## 2. 一次写入、读取与整理的流程
-
-### 2.1 在线消息与上下文
-
-1. API 根据认证确定 user 与调用角色，验证 binding、writer 和事件序号。
-2. Record Store 事务保存事件正文引用、stream 进度、user revision 和幂等结果。
-3. API 返回 AppendReceipt；原始记录立即可按 ID 或序号读取。
-4. Harness 自行更新工作 context，随后调用 putContext 保存不可变候选。
-5. Harness 在运行时应用候选，再调用 activateContext；Context Store 保存应用 receipt 并推进 head。
-
-步骤 2 与步骤 4 可以分开提交。因此记录已保存而 context 尚未更新是合法中间状态；恢复时由 Harness 重放未覆盖事件。服务不等待 notes 提取才确认原始输入。
-
-### 2.2 Router 检索用户信息
-
-Router 通过 getUserOverview 得到用户级 notes、项目目录、对话及任务索引。目录按持久对象枚举并分页，不由模型猜测用户有哪些项目。摘要是辅助字段，原始来源仍可定位。
-
-recall 默认覆盖该 user 的 notes 和当前 session 历史。Router 可显式加入 user_events，搜索其他会话证据；projectIds 只作为筛选条件。搜索由服务端 Retrieval 执行，Harness 不直接访问数据库或索引文件。
-
-流程为：读取授权 → 解析 corpus/项目条件 → 关键词召回 → 精确读取权威版本 → 校验来源、有效期和删除状态 → 返回证据与修订。向量召回与 rerank 可在基线不足时加入，公共接口不变。
-
-Worker 只能查询其 task 授权允许的材料。getUserOverview 同样执行授权过滤，Worker 不因持有 userId 就获得完整用户目录。Core 使用 Router 身份发现信息，再按任务传递所需引用。
-
-### 2.3 project notes 写入与后台维护
-
-Worker 完成项目任务后，可以 proposeNote(projectId, content, sourceRefs)。服务先保存提案，返回 proposal ID；验证器或 Memory Agent 检查证据、重复、冲突和适用范围后发布 NoteRevision。
-
-同一用户内跨项目的来源引用是合法的。例如 Genvagent 的 note 可以引用 analytics 中已经验证的文档方法，但结论仍应注明 Genvagent 的适用条件。只有充分支持跨项目适用时，才提出独立的 user note。
-
-用户在当前对话中的明确纠正先作为原始事件保存，由 Harness 立即处理；后台 note 发布不阻塞当前请求。后台修改不会直接推进 Router/Worker 的 ContextHead。
-
-## 3. 服务模块与接口函数
-
-| 模块 | 对外职责 | 内部依赖 |
+| 视图或维度 | 数据来源 | 解释 |
 | --- | --- | --- |
-| API / Session Registry | 用户鉴权、会话映射、授权、lease、幂等及版本协商 | Record/Context Store |
-| Record / Context Store | 事件追加、原文读取、context 候选与激活 | 数据库、blob store |
-| Note Store / Retrieval | 用户概览、notes 修订、搜索、反馈与变更 | 索引、来源关系、权威存储 |
-| Memory Agent / Validator | 提取、整理、修复、预备 notes、发布校验 | 受预算约束的模型客户端、job 队列 |
+| 用户画像 | 与用户有关的事实、偏好、目标及其证据 | 派生视图；区分已支持、推断和冲突，允许为空 |
+| 短期记忆 | 近期事件、当前目标、未决事项、活跃/空闲 session，以及短期条目 | 当前工作需要的信息，仍可持久化 |
+| 长期记忆 | 经验证适合跨会话复用的记忆条目 | 可被纠正或失效，长期不等于永久正确 |
+| Note | MemoryKind 为 note 的整理文本 | 表达形式，可以服务短期工作或长期复用 |
+| Collection / 标签 | 对记忆和相关来源的可选组织关系 | 可以不存在；旅行、学习、项目等均可作为名称 |
 
-### 3.1 API 与存储模块
+这些维度可重叠。例如“本次旅行预算”可以是短期 goal/constraint 的来源，而“用户明确要求优先采用公共交通”可以作为有适用条件的 preference；二者均可能出现在某份 note 中。它们不会因被写成 note 就成为永久用户画像。
 
-| 函数 | 输入与输出 | 事务边界 |
-| --- | --- | --- |
-| registerSession(domain, registration) | SessionRegistration → BindingState | 会话唯一映射、stream 与 context 的创建 |
-| resolveSession(domain, key) | SessionKey → BindingState | 同一读取视图中的进度、head 与 receipt |
-| changeWriter(binding, request) | LeaseRequest → WriterLease/释放确认 | 校验 owner、epoch、有效期 |
-| appendBatch(binding, records, afterSequence) | AppendRequest → AppendReceipt | 记录、stream head、user revision、幂等结果一起提交 |
-| readRange(binding, afterSequence, limit) | EventPage | 连续事件读取，正文通过 inline/blob 解引用 |
-| saveContext(binding, candidate) | ContextVersion | 正文完整性、来源、消费位置和 base revision 校验 |
-| activateContext(binding, request) | ActivateRequest → ContextHead | writer、版本比较、head 与 receipt 一起提交 |
-| readContext(ref) | ContextVersion | 检查当前授权和来源删除状态 |
+工作 context 只是某个 session 的选定工作视图，不包含该用户全部短期或长期记忆。记忆从短期转为长期需经过适用性验证；进程退出、task 完成和 session 退役都不触发自动提升。
 
-以上内部函数由公共 API 包装；幂等 key 与认证上下文由 API 传入。服务不依赖 Host SDK 或 Harness 的内存对象。
+## 2. Session 与进程分离
 
-### 3.2 概览、检索与 note 模块
+SessionDescriptor、stream 和 context 属于稳定的逻辑工作线程。RuntimeBinding 只帮助将 dsh/pi 原生身份映射到该线程；同一逻辑 session 可以被不同进程、不同挂载先后加载。
 
-| 函数 | 输入与输出 | 语义 |
-| --- | --- | --- |
-| getOverview(domain, readGrant, cursor) | UserOverview | 用户域目录；Router 可枚举所有项目，Worker 受授权限制 |
-| recall(domain, request) | RecallRequest → RecallResponse | 跨项目召回，返回具体证据和修订 |
-| readEvidence(domain, ref) | EvidenceRef → RecallItem | 精确读取，不经过相关性排序 |
-| acceptProposal(domain, proposal) | NoteProposal → proposal ID | 持久候选，不直接等同于已验证知识 |
-| publishNotes(changeSet) | MemoryChangeSet → 已发布修订 | 检查并发版本、来源与适用范围后原子发布 |
-| recordFeedback(domain, input) | FeedbackInput → feedback ID | 保存用户纠正或使用反馈，触发后台整理 |
-| listChanges(domain, readGrant, cursor) | changes page | 按授权过滤，至少一次交付 |
-| invalidateSource(domain, ref) | 失效影响范围 | 立即阻止不应读取的内容，再清理依赖索引与缓存 |
+Memory 不分配 Worker 进程，也不执行工具。服务通过 startRun/lease 保证每个 session 一个 writer；Core 在外部运行时加载状态。所有 Host 离线时，Memory 仍可整理记忆和维护目录。
 
-### 3.3 Memory Agent 模块
+Session 的生命周期为 open/retired，忙闲由有效 lease 和未决动作决定。正常 task 结束只 endRun；退役需额外条件提交。退役保留历史用于查询和分叉，与删除策略分开。
 
-| 函数 | 输入与输出 | 职责 |
-| --- | --- | --- |
-| scheduleDream(userId, mode, projectIds?) | DreamJob | 选择一个用户的增量资料；项目条件可选 |
-| claimJob(jobId, workerId) | 带 epoch 的 job lease | 多实例下原子认领 |
-| buildChangeSet(job) | MemoryChangeSet | 生成带来源的候选与修订 |
-| validateChangeSet(changeSet) | 校验结果 | 验证证据、适用范围、冲突和当前版本 |
-| commitChangeSet(changeSet, lease) | 已发布 notes 与 changes | 检查有效 lease，原子发布并完成 job |
+## 3. 写入、发现与整理流程
 
-原始输入、候选、校验结果和发布版本分别保存。未发布候选不进入普通 recall。job 失败或预算耗尽保留诊断，不阻塞在线记录与读取。
+### 3.1 执行状态写入
 
-## 4. 关键数据结构
+appendEvents 原子保存事件、stream 进度、相关控制索引、user revision 与幂等结果。context 候选由 Core 单独提交，Memory 不因事件追加而自动改写模型输入。
 
-UserDomain、NoteScope、Content、EvidenceRef、NoteProposal 等类型由公共协议定义；本节定义服务内持久对象。
+新进程 startRun 后，原样加载当前 context 使用 confirmContextLoaded 记录本 run 的应用证明。context 改变时走 putContext/activateContext。旧进程回执不能证明新进程已经加载。
 
-### 4.1 用户状态与 notes
+所有执行写入检查 session 开放、run 有效和 epoch 匹配。endRun 把任务结果与未决动作保留下来，释放占用；过期 lease 不代表外部动作成功。
+
+### 3.2 Router 发现与检索
+
+getUserOverview 枚举用户记忆、可选集合、session 和任务。getProfile 返回带来源的用户信息视图。discoverSessions 返回候选摘要及其 ContextRef，Router 精确核对当前 head 和执行状态后再继续。
+
+recall 从原始事件和记忆条目中检索。关键词基线先按 user、run 授权、可选标签/集合和时间条件筛选，再读权威内容校验。后续可加入向量与重排；集合目录为空不会导致检索不可用。
+
+会话摘要可能落后于当前 head，返回时同时保留摘要来源版本。摘要用于发现，执行权必须由 startRun 的条件检查取得。readEvidence 精确读取来源，恢复不依赖搜索相似文本。
+
+### 3.3 后台整理
+
+Harness 或 Memory Agent 通过 MemoryProposal 提交候选，验证后发布 MemoryItemRevision。kind、horizon、标签和集合相互独立；同一条目不因放入两个集合就保存两份事实。
+
+Memory Agent 可提炼经历、维护画像引用、修订方法和生成预备 notes，但不能擅自推进活动 ContextHead。session 退役后的资料仍可成为整理来源，当前任务约束不能因为退役就变成长期偏好。
+
+## 4. 模块与接口函数
+
+| 模块 | 责任 |
+| --- | --- |
+| API / Session Registry | 用户授权、逻辑 session、原生映射、run/lease、生命周期 |
+| Record / Context Store | 事件追加、控制索引、context 保存、激活与加载证明 |
+| Memory Store / Views / Retrieval | 条目、画像、短期/长期视图、集合、session 发现与来源读取 |
+| Memory Agent / Validator | 提取、校正、压缩、预备 notes 与发布验证 |
+
+### 4.1 Session 与执行状态
+
+| 函数 | 语义与事务边界 |
+| --- | --- |
+| createSession / forkSession | 创建稳定 session、stream/context；fork 来源为固定版本，不能继承未决动作的执行权 |
+| bindRuntime / resolveRuntime | user + RuntimeKey 唯一映射；不会改变 session 的逻辑归属 |
+| startRun / renewRun | 原子校验 lifecycle、head、授权与 lease；epoch 按 session 单调增加 |
+| appendBatch | 记录与控制索引一起提交，避免退休检查使用落后状态 |
+| saveContext / activateContext | 候选不可变；激活检查 current run、head、hash 和来源 |
+| confirmContextLoaded | 为当前 run 保存当前版本的加载回执，不改变 head |
+| endRun | 保存终态、结果引用与未决动作后释放占用 |
+| retireSession | session revision、head 与接收位置一致，无有效 run、排队输入、未完成任务和未决动作时冻结 |
+
+未决动作、排队输入和未完成任务来自已提交的控制记录与核对结果，不能仅依据 endRun 的空列表清除。等待用户的 task 不因释放进程就消失，必须完成、明确取消或转交后才能退役。startRun 与 retireSession 竞争同一条件事务；只允许一种结果成功。
+
+### 4.2 查询、视图与记忆发布
+
+| 函数 | 结果 |
+| --- | --- |
+| getOverview / getProfile | 可分页目录或画像视图，保留来源与读取 revision |
+| getShortTermView / getLongTermView | 按用途组合近期状态或可复用条目；可由 overview/recall 参数表达，不强制独立网络接口 |
+| discoverSessions / readSession | 候选摘要或精确状态 |
+| recall / readEvidence | 相关材料或精确原文 |
+| acceptProposal / publishMemories | 持久提案，或经验证后原子发布修订 |
+| recordFeedback / invalidateSource | 保存纠正、标记来源与依赖失效 |
+| listChanges | 用户资料、session 生命周期及来源变化，至少一次交付 |
+
+所有视图检查当前授权。Worker 的 run grant 不因 profile、集合或来源展开而扩大。派生视图不成为新的权威事实副本。
+
+### 4.3 Memory Agent
+
+scheduleDream 按 user 和可选输入范围创建 job；claimJob 取得后台 worker lease；buildChangeSet 生成候选；validateChangeSet 验证来源、适用性和并发修订；commitChangeSet 原子发布并完成 job。
+
+未发布候选不进入普通 recall。预算耗尽停止后台任务，不阻塞在线消息存储或读取。后台 worker 与 Harness Worker process 是不同角色。
+
+## 5. 服务内部结构
+
+共享 ID、UserDomain、MemoryKind、MemoryHorizon、Content 和 EvidenceRef 由协议定义。
+
+### 5.1 条目、视图来源与集合
 
 ```typescript
 interface UserMemoryState {
   domain: UserDomain;
-  revision: number;               // 会话目录、事件、已发布 notes 等资料的单调版本
+  revision: number;
   indexedThroughRevision: number;
 }
 
-interface NoteRevision {
-  noteId: ID;
+interface MemoryItemRevision {
+  memoryId: ID;
   revision: number;
   previousRevision?: number;
   domain: UserDomain;
-  scope: NoteScope;
-  kind: "fact" | "preference" | "decision" | "procedure"
-    | "episode" | "prospective_note";
+  kind: MemoryKind;
+  horizon: MemoryHorizon;
   key: string;
   content: Content;
+  labels: string[];
+  collectionIds: ID[];
   sourceRefs: EvidenceRef[];
-  epistemicStatus: "supported" | "inferred" | "unverified" | "disputed";
   applicability: string[];
+  epistemicStatus: "supported" | "inferred" | "unverified" | "disputed";
+  conflictWith: EvidenceRef[];
   validFrom?: Timestamp;
   validUntil?: Timestamp;
-  conflictWith: EvidenceRef[];
-  verifiedAt?: Timestamp;
   createdAt: Timestamp;
 }
 
-interface NoteHead {
-  noteId: ID;
+interface MemoryHead {
+  memoryId: ID;
   currentRevision: number;
 }
 
-interface NoteReadState {
-  noteId: ID;
+interface MemoryReadState {
+  memoryId: ID;
   revision: number;
-  stale: boolean;                 // 当前读取状态，独立于不可变正文
+  stale: boolean;
   invalidatedAt?: Timestamp;
 }
 
-interface TaskIndexEntry {
-  taskId: ID;
+interface MemoryCollection {
+  collectionId: ID;
   domain: UserDomain;
-  conversationId: ID;
-  projectId?: ID;
-  routerBindingId: ID;
-  workerBindingId?: ID;
-  state: string;
-  latestEvent: EvidenceRef;
-  indexedAtUserRevision: number;
+  label: string;
+  description?: string;
+}
+
+interface SessionSummary {
+  sessionId: ID;
+  sourceContext: ContextRef;
+  text: string;
+  unresolvedQuestions: string[];
+  sourceRefs: EvidenceRef[];
 }
 ```
 
-同一 noteId 的 user 和 NoteScope 固定。项目知识提升为用户级知识时创建新的 note 并引用原证据，不移动或覆盖原项目记录。key 的匹配范围为 userId + NoteScope；相同词语不构成跨项目合并依据。
+条目正文与修订不可变，当前失效状态单独维护。horizon 改变生成新修订并说明依据；用户归属不可改变。key 只辅助主题匹配，不构成自动合并依据。
 
-NoteRevision 正文不可变，NoteReadState 表示当前失效状态。supported 仅表示在声明条件下有证据；来源存在不自动证明陈述正确。无法确定的冲突保留 disputed/conflictWith。
+用户画像基于有来源的条目组成 ProfileView，不设置强制的人口统计字段。近期事件和 session 进度可以直接服务短期视图，无须先转成 note。
 
-TaskIndexEntry 是从事件派生的查询索引，不是 Memory 调度 Worker 的状态机。任务执行仍由 Harness 负责，索引落后时可通过 latestEvent 与原始记录核对。
+### 5.2 Run 记录
 
-### 4.2 后台任务与变更集
+```typescript
+interface RunRecord {
+  runId: ID;
+  domain: UserDomain;
+  sessionId: ID;
+  taskId?: ID;
+  executorId: ID;
+  readGrant: ReadGrant;
+  leaseEpoch: number;
+  status: "active" | "completed" | "paused" | "failed" | "expired";
+  startedAt: Timestamp;
+  endedAt?: Timestamp;
+  finalContext?: ContextRef;
+  resultRefs: EvidenceRef[];
+}
+```
+
+RunRecord 保存执行历史，进程本身不存入业务状态。expired 只表示写入权结束；未知外部动作仍保留在 session 控制索引中，直到核对。
+
+### 5.3 Dreaming 与候选发布
 
 ```typescript
 interface DreamJob {
   id: ID;
   domain: UserDomain;
   mode: "consolidate" | "repair" | "prepare_note";
-  projectIds?: ID[];              // 可选整理范围，不是存储分区
   inputRefs: EvidenceRef[];
+  collectionIds?: ID[];
   readUserRevision: number;
-  targetScopes: NoteScope[];
   status: "queued" | "running" | "validating" | "completed" | "failed" | "canceled";
   maxModelCalls: number;
   maxCostUsd: number;
@@ -188,10 +216,10 @@ interface MemoryChangeSet {
   dreamJobId: ID;
   domain: UserDomain;
   readUserRevision: number;
-  expectedRevisions: { noteId: ID; revision: number | null }[];
-  candidates: NoteRevision[];
+  expectedRevisions: { memoryId: ID; revision: number | null }[];
+  candidates: MemoryItemRevision[];
   checks: {
-    candidateNoteId: ID;
+    candidateMemoryId: ID;
     result: "supported" | "uncertain" | "rejected";
     evidence: EvidenceRef[];
     explanation: string;
@@ -200,74 +228,35 @@ interface MemoryChangeSet {
 }
 ```
 
-一个 job 只处理一个 user 的资料，可以覆盖多个 project。首版每个 user 同时运行一个整理 job，不同用户并行；同一用户的 Router 与 Worker 在线执行不受此串行规则限制。
+首版每个 user 同时运行一个整理 job，用户之间并行；在线 session 可以并行写入。发布检查 expectedRevisions 和新增证据的影响，推理期间不持有事务锁，重验受预算约束。
 
-发布前检查 expectedRevisions 及 readUserRevision 之后的相关新增信息。保守实现可以在用户数据变化后重新验证，并受重试预算约束。模型推理不持有数据库事务锁。
+发布、memory heads、user revision、changes 和 job 完成在同一事务提交。worker 丢失 lease 后不得发布，重试沿用 changeSet ID。内部 job 状态与未发布候选不推进资料版本。
 
-job 完成、notes 修订、heads、user revision 和 changes 在同一事务提交。后台 worker 丢失 lease 后不能发布；重试使用同一 changeSet ID，避免重复修订。
+## 6. 存储、一致性与退役
 
-## 5. 存储与一致性
-
-| 数据集合 | 分区与关键关联 |
+| 数据集合 | 关键关联与约束 |
 | --- | --- |
-| user_state | userId → revision、索引进度 |
-| session_bindings / writer_leases | userId + SessionKey 唯一映射；每个 binding 独立 writer |
-| records / stream_heads | 归属 user，经 binding 关联独立 stream；sequence 连续 |
-| context_versions / context_heads / receipts | 归属 binding，保存不可变正文与应用确认 |
-| note_revisions / note_heads / note_read_states | 归属 user，NoteScope 区分 user/project 资料 |
-| conversation_index / task_index / project_index | 用户域内可重建目录，带来源与索引进度 |
-| proposals / jobs / change_sets | 用户域内候选、整理任务及发布状态 |
-| changes / idempotency_results | user 变更游标；调用身份与请求正文绑定的幂等结果 |
-| blobs / source_links / retrieval indexes | 用户隔离、大正文、来源反向索引与可重建检索索引 |
+| user_state / changes | 用户域资料版本与变化 |
+| sessions / stream_heads | 稳定 sessionId，stream 连续序号，open/retired 生命周期 |
+| runtime_bindings | 原生身份定位逻辑 session，一对多运行映射不改变逻辑身份 |
+| runs / session_leases | 执行记录，每个 session 一个有效 writer |
+| records / control_indexes | 原始事件与待处理 task/action 的权威提交索引 |
+| context_versions / heads / application_receipts | 不可变快照，当前指针，以及各 run 的加载/应用证明 |
+| memory_revisions / heads / read_states | 记忆修订、当前版本与失效 |
+| collections / profile_index / session_summaries | 可选组织和派生视图 |
+| proposals / jobs / change_sets | 候选、预算、验证与幂等发布 |
+| blobs / source_links / retrieval_indexes | 大正文、来源反向关系与可重建索引 |
 
-用户资料保存在数据库与 blob store 中，不要求对应单个 Markdown 文件。project notes 可以提供 Markdown 导入/导出，但文件形式不决定归属与一致性语义。
+retireSession 只冻结该 session 的继续执行能力，保留流、快照和引用。one_shot 或 idle 策略必须经过同一服务检查，不能直接删除数据表；有未决动作或仍在执行时拒绝退役。
 
-跨 project 引用只要属于同一 user 且符合调用授权即可。跨 user 引用拒绝；删除与授权变化对旧版本同样生效。Worker 的 task grant 在检索和精确读取时执行，不能借来源展开读取整个 Router 会话。
+物理删除先阻止来源及依赖读取，再清理条目、索引、快照和 blob，发布失效变化。已退役内容的读取同样服从删除与授权规则。
 
-minUserRevision 约束检索与目录的可见数据。索引落后时补读权威存储，或返回 NOT_READY。目录分页游标绑定用户、读取授权与读取版本，不能用另一用户或 Worker 的游标扩大读取范围。
+索引落后于 minUserRevision 时补读权威存储或返回 NOT_READY。profile、短期/长期视图与 session 摘要均可重建；摘要来源版本与当前 head 不相同必须可见，不能充当执行前版本校验。
 
-user revision 随会话注册、事件、已发布 notes、反馈与来源失效提交而递增。context 采用独立 head revision，未发布提案、job 状态和未引用 blob 不改变资料版本，避免后台任务因自身内部写入触发反复重验。
+## 7. 独立部署与验收
 
-数据批次提交只短暂更新 user revision，不在模型调用期间锁定用户。首版使用单用户单调版本便于恢复与失效判断；高吞吐用户的版本分配与索引成本需在压测中单独评估。
+单机使用 API、Memory Worker、PostgreSQL 与持久 blob 目录；集群增加无状态 API/后台副本并改用共享对象存储。所有 session、epoch、head、run 与幂等记录在共享数据库中，客户端只改变 endpoint。
 
-## 6. Memory Agent 的整理策略
+后台整理生成经历摘要、修订方法及预备 notes；原始来源保留可取回引用。未来 query 的预备计算计入成本，适用性和时效必须验证。[Dreams](https://platform.claude.com/docs/en/managed-agents/dreams)、[Sleep-time Compute](https://arxiv.org/abs/2504.13171)
 
-长期 compaction 生成 episode 摘要、合并重复知识、修订方法和维护目录；原始事件保留可取回引用。活动 context 的压缩由 Harness 执行。
-
-用户级偏好要有明确或充分的跨任务证据。只在某项目出现的约束留在 project note；遇到不同项目要求不同，应保留适用范围，不能让最近一次项目要求覆盖用户的全部偏好。
-
-prepare_note 从高频问题、未完成任务和昂贵的重复分析开始，生成带来源、适用条件和有效期的 prospective_note。它可以利用用户跨项目历史，但不提前执行预想中的外部动作。
-
-dreaming 的内部推理日志标记为内部执行数据，默认不重新作为外部事实输入。验证器检查来源、关键数值、时间、适用条件和已知冲突，不因另一个模型赞同就提升为 supported。
-
-设计参考 Anthropic 的后台记忆整理与 Sleep-time Compute 的预备计算思路；离线成本与后续任务收益一并评估。[Dreams](https://platform.claude.com/docs/en/managed-agents/dreams)、[Sleep-time Compute](https://arxiv.org/abs/2504.13171)
-
-## 7. 单机与集群部署
-
-```mermaid
-flowchart LR
-    C[Harness Clients] --> A[Memory API / 多副本入口]
-    A --> D[(PostgreSQL)]
-    A --> B[(Blob Store)]
-    W[Memory Worker / 多实例] --> D
-    W --> B
-    W --> L[模型服务]
-```
-
-单机使用一个 API、一个 Memory Worker、PostgreSQL 和持久 blob 目录；API 与 Worker 可以同一程序按角色启动。Host 退出不影响服务整理用户 Memory。
-
-集群增加无状态 API 副本和后台 Worker，使用共享 PostgreSQL 与对象存储。会话映射、writer epoch、head、job 和幂等结果存共享数据库，不要求 sticky session。后台 job 按 user 领取，在线事件仍按 binding 并发写入。
-
-客户端配置 endpoint 与用户凭据即可；projectId 是任务/查询参数，不属于连接身份。迁移到集群不改变用户域和协议。数据库与 blob 共同备份，已确认正文须在部署声明的持久性范围内保留；增加 API 副本不替代数据层高可用。
-
-## 8. 独立验收
-
-1. 一个 user 的两项目 notes 均可从 Router 发现与检索，用户级偏好只维护一份；其他用户同名项目隔离。
-2. 原始消息写入后立即可读，无须等待 dreaming；context 尚未提交时可按消费位置恢复增量。
-3. Worker 可以提议自己任务项目的 notes，发布后 Router 可跨项目找到，并保留适用条件。
-4. Memory 不修改活动 context；所有 Host 离线时仍可完成 notes 整理。
-5. 幂等追加、旧 writer 拒绝、并发 context 激活、重复 job 发布符合公共契约。
-6. 检索与目录在指定 minUserRevision 下不遗漏必需数据；索引及 API 节点重启不丢权威数据。
-7. 单机迁移集群仅调整服务连接；用户域、事件引用和上下文版本保持不变。
-
-质量评估包括跨项目检索命中率、项目约束误泛化率、错误复发、过期使用率及后续任务收益；成本覆盖在线检索、后台模型、存储与预备 notes。
+验收包括：无集合用户正常使用；画像可追溯且不把一次性约束泛化；不同进程继续同一 session；fork 只继承固定来源；retire 与 startRun 竞争正确；未知工具结果阻止错误退役；全部 Host 离线后仍可整理记忆；单机/集群通过相同持久化契约。
