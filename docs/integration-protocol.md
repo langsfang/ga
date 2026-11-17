@@ -1,267 +1,264 @@
-# Agent Harness 与 Memory System 交互模型与协议
+# Harness 与 Memory：交互逻辑、接口与数据结构
 
-状态：设计草案 v0.4；2026-11-17。接口尚未实现。
+状态：设计草案 v0.5；2026-11-17。接口尚未实现。以 user 为 Memory 归属域，Harness Core 管理 Router/Worker 的逻辑执行循环。
 
-本文定义 Genvagent Harness 与 Memory System 之间的数据模型、所有权、同步、检索和恢复契约。前七节说明概念及执行流程，后续章节定义数据结构、HTTP 接口和异常处理。接口中的每个标识都对应一个明确的持久化对象。
+本文依次描述交互概念、每轮执行过程、逻辑接口函数、数据结构和 HTTP 映射。[Harness](agent-harness.md) 展开 Core 的执行职责，[Memory](memory-system.md) 展开服务内部实现。
 
-## 1. 系统角色与边界
+## 1. 系统角色
 
-| 术语 | 定义 | 主要职责 |
-| --- | --- | --- |
-| Host | 加载 Genvagent 插件的完整 agent 应用，例如 dsh、pi | 提供模型调用循环、工具执行、权限控制、会话管理和界面 |
-| Genvagent Harness | 本项目提供的插件层，由 Harness Core、Host Adapter 和 Memory Client 组成 | 接入 Host 事件，管理工作上下文，执行 Router 策略，与 Memory 交换数据 |
-| Host Adapter | Genvagent Harness 内针对某个 Host 的适配模块 | 将 Host 的会话、消息、工具结果和扩展点转换为 Genvagent 的统一表示 |
-| Memory System | 独立部署的持久化与记忆服务 | 保存记录和上下文版本，执行记忆检索、修订与后台整理 |
+用户只与 **Router Agent** 对话。Router 使用该用户的统一 Memory 理解目标和历史，决定直接回答、继续已有任务或委派 Worker。Worker 执行具体任务，将结果交回 Router，由 Router 汇总并回复用户。
 
-dsh、pi 本身也属于广义的 agent harness。本文使用 Host 表示它们相对于 Genvagent 插件的角色；后文的 Harness 专指 Genvagent Harness。Host 与 Genvagent Harness 之间是应用与插件的关系。
+| 组件 | 职责 |
+| --- | --- |
+| Harness Core | 管理对话轮次和 agent step，运行 Router/Worker 的逻辑循环，管理任务与上下文，调用 Memory |
+| Router Agent | Core 中面向用户的 agent 角色；跨项目检索用户信息、分配任务、处理结果、生成最终答复 |
+| Worker Agent | Core 管理的任务执行角色；使用独立上下文执行分配的任务 |
+| Runtime Driver / Host Adapter | 将 Core 的执行动作映射为模型调用、工具执行及 Host 生命周期事件 |
+| Host | dsh、pi 等完整应用；插件模式下提供实际模型与工具运行能力、界面和执行环境 |
+| Memory System | 保存用户全部会话记录、上下文版本、任务证据和 notes，提供检索及后台整理 |
 
-Host 管理模型和工具的执行状态，Genvagent Harness 管理输入上下文及同步进度，Memory System 管理持久化数据。Memory Agent 是 Memory System 内部的后台组件，可以在 Host 离线时整理记忆；它不调度 Host 的工具，也不直接修改活动会话的模型输入。
+Router 和 Worker 共用 Core 的 step 状态机，各自使用独立 session/context。插件接入不改变这些逻辑角色；Host 是否允许 Core 在每个请求边界控制下一步，决定该 Adapter 能提供的能力等级。
 
-## 2. 信息模型
+## 2. 交互概念
 
-### 2.1 原始记录与长期记忆
+### 2.1 用户统一 Memory 与 project notes
 
-| 对象 | 定义 | 生命周期 | 所有权与来源 |
-| --- | --- | --- | --- |
-| Record | 一次可观察事件的持久化表示，例如用户消息、模型输出、工具结果、文件读取结果 | 按记录流追加；正文和来源标识不因摘要生成而改变 | 访问策略继承所属会话关联，另记录实际产生者 |
-| MemoryRevision | 从一个或多个 Record 派生的知识、偏好、决策或方法的某次修订 | 后台验证后发布；更新生成新修订，保留旧版本和冲突状态 | 必须记录证据引用、适用范围、所属用户和可见性 |
-| WorkingContext | Harness 为下一次模型调用构建的、有序且受容量约束的信息表示 | 随执行步骤更新；每次持久化产生不可变版本 | 引用已选 Record 和 MemoryRevision，由 Harness 决定内容 |
-
-Record 保证可追溯性；MemoryRevision 提供跨会话复用；WorkingContext 决定当前调用可使用的信息。它们是三类独立对象，派生关系由来源引用维护。删除工作上下文中的一段日志只改变输入选择，不删除对应 Record。
-
-来源关系同时承担校验作用。一个用户消息可以直接作为“用户提出了某项要求”的证据；如果它描述的是外部系统状态，则还需要对应观察才能把该描述发布为已验证事实。MemoryRevision 的可信状态与来源记录的存在性分别管理。
-
-### 2.2 工作上下文的内容与组装
-
-工作上下文包含当前目标、必须保留的用户约束、相关证据、检索得到的记忆、执行进度和必要的消息/工具交换。Harness 的 Context Controller 负责选择与排序，Host Adapter 将其转换为 Host 支持的消息表示。
-
-Host 的系统指令、工具定义和授权由 Host 提供并保持受保护。下一次请求使用这些受保护部分和经校验的工作上下文。模型可通过上下文编辑工具修改可编辑内容，但必须保留来源和工具调用/结果配对。
-
-工作上下文是显式输入的序列化表示，不包含模型内部隐状态、API 凭据或正在运行的操作系统进程。它的恢复能力与 Host 执行环境的恢复能力分别定义。
-
-### 2.3 上下文版本的提交状态
-
-“候选上下文”指**已经完成组装、准备作为下一次模型输入，但尚未完成应用确认的新版本**。该术语表示版本提交状态，不表示检索候选集合。
-
-| 状态 | 持久化与执行事实 | 可否视为当前版本 |
-| --- | --- | --- |
-| 已组装 | Harness 已生成正文，尚未获得 Memory 持久化确认 | 否 |
-| 已保存候选 | Memory 已保存不可变版本；当前版本指针仍指向旧版本 | 否 |
-| Host 已应用、确认待提交 | Adapter 已修改 Host 工作视图，并保存本地应用标记 | 需要完成或恢复确认流程 |
-| 已激活 | Memory 已接受应用回执并推进当前版本指针 | 是；模型是否已调用仍由调用记录判断 |
-
-例如当前版本为 v7，Harness 根据新输入构建 v8。保存 v8 后仍以 v7 为已确认版本；只有 Host 应用 v8 且确认事务成功，当前指针才移动到 v8。激活成功不等于模型已返回结果。
-
-## 3. 用户数据组织与存储
-
-### 3.1 身份、归属与可见性
-
-userId 表示用户的稳定身份，与 Host 进程 ID、模型生成者 ID 和 API 服务账号不同。Memory 从认证信息确定有效用户；服务账号代用户请求时必须具备相应委托权限，不能仅信任正文中的 userId。
-
-workspaceId/projectId 确定数据所属项目。每个会话关联还记录 ownerUserId；其记录流和工作上下文继承该所有权。一条记录由模型或工具生成，也仍归属于该会话的用户，实际作者另外记录为 producer 与 actorId。
-
-原始会话、上下文和派生个人记忆默认 private，仅所有者及被明确授权的服务可读。经授权共享的数据可以标记为 project，供具有项目访问权限的成员使用。相同 projectId 只确定数据分区，不自动授予其他用户读取私有会话的权限。
-
-第一版的个人记忆仍位于一个 project 内；跨项目用户画像不在当前范围。可见性不能因 dreaming 而扩大：依赖私有证据的 note 保持相同用户的 private 范围，只有满足共享授权的来源才能形成 project 可见的知识。
-
-### 3.2 Memory 中的逻辑组织
-
-SessionBinding（会话关联）将某个用户在某个项目中的 Host session/branch，映射为 Memory 中的一条记录流和一个工作上下文版本序列。记录流按 sequence 连续追加；上下文序列保存每次构建的版本，ContextHead 单独指向当前已确认版本。它们共同支持同步进度查询与确定性恢复。
-
-下图是逻辑归属，不是服务端目录结构。一个用户可以有多个 Host 会话，同一个会话可以产生多个独立分支。
+**一个 user 对应一个统一 Memory 域。** project 是该域内的资料分类和任务属性，不是 Memory 的顶层分区，也不是 Router 的默认检索边界。
 
 ```text
-workspace w-1 / project genvagent
-  user user-42
-    binding b-dsh-1
-      Host identity: dsh / installation h-1 / session s-9 / branch main
-      record stream: stream-dsh-1
-      context versions: ctx-dsh-1 / v7, v8, ...
-      active context: ctx-dsh-1 / v8
-    binding b-pi-1
-      Host identity: pi / installation h-2 / session s-3 / branch main
-      record stream: stream-pi-1
-      context versions: ctx-pi-1 / ...
-    private memories: m-17 / revision 1, 2, ...
-  user user-77
-    bindings and private memories owned by user-77
-  project-visible memories
-    explicitly shared revisions readable by authorized project members
+user u-42
+  user notes                  # 用户级偏好、长期目标、通用方法
+  project notes
+    genvagent/                # 本项目决策、约束、待办
+    analytics/                # 另一个项目的知识与进度
+  router conversations       # 可以讨论多个项目，不要求绑定 project
+    conversation c-1
+      router session / record stream / context versions
+  worker sessions
+    task t-1 → project genvagent / 独立记录流与上下文
+    task t-2 → project analytics / 独立记录流与上下文
+  tasks / evidence / blobs / changes
 ```
 
-Memory 使用数据库保存这些对象和关联，大正文保存到 blob store。不会把一个用户的全部内容拼接成单个 Markdown 文件。
+Router 可以发现该用户所有项目、会话和 notes，并跨项目检索。它先读取用户概览、当前对话及有关记忆；“可访问完整 Memory”不意味着把全部历史放入一次模型输入。
 
-| 集合 | 定位键或关联 | 保存内容 |
+project note 仍属于该 user，记录项目范围内的要求和事实。同一项目名称在不同用户下不合并，跨用户团队知识库不属于第一版。用户级 note 与项目级 note 可以同时存在，项目约束不能未经验证提升为用户全局偏好。
+
+Worker 默认接收任务目标、相关用户约束、选定证据及所需 project notes。它不继承 Router 的完整上下文；需要更多信息时，经受控检索或请求 Router 补充。
+
+### 2.2 对话、轮次、步骤和任务
+
+| 概念 | 定义与关系 |
+| --- | --- |
+| Conversation | 用户与 Router 的持续对话，可跨多个 project 和多个 turn |
+| Session / Binding | 一个 Router 或 Worker 执行分支与 Memory 的关联，拥有独立记录流和上下文版本 |
+| Turn | 从一条新的用户输入开始，到 Router 返回最终答复、等待用户补充、失败或取消结束 |
+| Agent Step | 一个 agent 的一次模型调用及其决策处理；一个 turn 可以包含多个 Router step 和多个 Worker step |
+| Task | Router 委派给 Worker 的工作单元，关联创建它的 turn；Worker 的输出先回到 Router |
+| Message | 用户输入、assistant 输出或工具结果等模型可见消息 |
+| Record / Event | 持久化事件；可以携带 Message，也可以记录任务状态、模型调用状态等非消息信息 |
+
+第一版同一 Router conversation 串行处理用户 turn。执行中的新输入先持久化并排队；显式纠正或取消使未执行的旧计划失效，在下一个安全边界处理。Worker 并行使用独立 session；不能并发修改同一个 Router context。
+
+排队输入先只进入记录流，不提前加入当前 turn 的模型消息。startTurn 记录输入引用，轮到该 turn 时才从原事件追加到 context；不重新写一份用户 Message。执行状态与消息投影分别恢复，context 的消费位置不表示排队输入或任务已执行完成。
+
+Worker 遇到需要用户决策的问题时，返回待澄清结果，由 Router 询问用户。用户的回答开启下一 turn，并可继续原任务。迟到的 Worker 结果保留原 task/turn 关联，不直接追加到另一个 turn 的模型输入。
+
+### 2.3 原始记录、工作上下文和 notes
+
+- **原始记录**是追加式事实日志，保留消息、工具交换、任务分派及结果的来源与顺序。
+- **工作上下文**是当前 agent 的模型输入工作视图，包含目标、约束、消息、证据和进度；允许追加、选择、压缩与编辑。
+- **notes**是可复用知识，按 user 或 project 标注适用范围，保留证据和修订。它们可以由 Worker 提议，也可以由 Memory Agent 整理产生。
+
+工作上下文中的消息有对应事件引用。检索到的 note 作为带 revision 的材料进入 context，不改写为用户说过的话。压缩或移出一段上下文不会删除原始事件。
+
+SessionBinding 将 session 关联到 record stream 和 context。ContextVersion 是不可变快照，ContextHead 指向已确认应用的版本。Memory 保存这些对象；Core 决定下一版本的内容。
+
+## 3. 一轮对话如何执行
+
+### 3.1 从用户输入到 Router 的第一次调用
+
+1. **创建 turn。** UI 或 Host 将稳定的输入 ID 和文本交给 Core.submitUserMessage。Core 在原 Router conversation 中分配 turnId，重复提交相同输入 ID 返回同一 turn。
+2. **持久化输入。** Core 为用户 Message 建立事件 ID、sequence 和本地待发送日志，调用 Memory.appendEvents。确认后，该消息已经属于用户 Memory，无须等待模型回答或 dreaming。
+3. **追加到上下文。** ContextController.appendMessages 将已提交事件投影到 Router 的工作视图。按 eventId/messageId 去重，保持 user/assistant/tool 的顺序。此时修改的是尚未提交的工作副本。
+4. **读取相关记忆。** Core 读取用户概览并调用 recall，范围默认是该 user 的全部可读 notes 与历史。当前输入作为必需材料保留，项目只在任务明确后用于检索筛选。
+5. **提交模型输入视图。** ContextController 组装候选版本；Memory.putContext 保存快照。Driver 应用该视图并持久化 marker，Memory.activateContext 确认后，Core 才允许受管理的模型调用。
+6. **执行 Router step。** Driver 调用模型。Router 可以选择直接回答、调用工具、读取更多记忆或委派 Worker；结果重新进入同一事件与上下文处理流程。
+
+### 3.2 Router 委派、Worker 循环与结果返回
+
+Router 通过受控的 delegate 动作产生 TaskSpec。Core 先持久化分派事件，调用 Driver.ensureWorker 取得可恢复的 Worker session 身份，再创建独立 binding，将任务输入与选定证据写入 Worker 记录流并构建初始 context。ensureWorker 只创建或定位执行容器，不启动模型；Worker 第一次调用也必须经过 Core 的上下文提交与放行。
+
+Worker 的循环与 Router 相同：准备上下文 → 调用模型 → 持久化输出 → 处理工具调用 → 持久化工具结果 → 追加 context → 下一 step。模型提出工具调用不代表工具已经执行；Core/Driver 记录具体 toolCallId，并在授权后调用实际工具。
+
+Worker 完成后，先持久化最终输出和任务结果。Core 将 TaskResult 转换为 Router 的结果事件，引用 Worker 来源，并完成原 delegate 工具交换。Router 下一 step 读取该结果，决定继续委派、追问或生成答复。
+
+Worker 和 Router 的事件序号分别递增，不能把两个流按网络到达时间直接拼接。Worker 结果进入 Router 是一次新的消息投递，投递标识由 taskId 与结果 ID 决定，重试不会重复追加。
+
+### 3.3 一次消息追加的完整路径
+
+```text
+用户输入 / 完成的模型输出 / 已确认工具结果
+  → Core 规范化为事件，保存本地发送日志
+  → Memory.appendEvents：事务写入原始正文、stream 进度、user revision
+  → ContextController.appendMessages：从已提交事件更新工作副本
+  → ContextController.buildContext：合并目标、notes 和证据，执行预算与格式校验
+  → Memory.putContext：保存候选快照
+  → Driver.applyContext：应用到下一请求视图或当前工作视图，持久化 marker
+  → Memory.activateContext：推进已确认版本
+```
+
+这里有两个不同的 append：**appendEvents 追加持久日志；appendMessages 更新工作上下文中的消息序列。** Memory 不会收到一条事件就自动改写 context，Core 也不能仅修改内存 context 而跳过原始记录。
+
+以一次工具调用为例，以下只展示工作上下文中的消息部分；目标、约束和检索 notes 作为其他 blocks 保存：
+
+| 新增 Message | append 后的消息顺序 | 下一动作 |
 | --- | --- | --- |
-| bindings | bindingId；另有用户、项目和 Host 会话身份的唯一映射 | owner、可见性、Host 会话位置、streamId、contextId |
-| records | streamId + sequence；eventId 用于精确引用 | 消息/工具结果正文、产生者、时间与来源 |
-| context_versions | contextId + versionId | 序列化工作上下文及已纳入的记录位置 |
-| context_heads | contextId | 当前已确认采用的 versionId 和指针修订号 |
-| memory_revisions | memoryId + revision | 私有或项目可见的知识正文、证据和适用条件 |
-| blobs / retrieval indexes | blobId；Record 或 MemoryRevision 的引用 | 大正文；可重建的关键词/语义检索索引 |
+| m1：用户请求 | 原有消息 → m1 | 保存并激活 context，调用模型 |
+| m2：assistant 提出 toolCall t1 | 原有消息 → m1 → m2 | 先保存 m2，再执行工具 t1 |
+| m3：工具 t1 的结果 | 原有消息 → m1 → m2 → m3 | 保存并激活含完整工具交换的 context，再调用模型 |
+| m4：assistant 最终答复 | 原有消息 → m1 → m2 → m3 → m4 | 保存最终 context，再记录 turn 完成 |
 
-对一个用户的完整记录查询，先按有效用户和项目找到可访问的 bindings，再读取其各条记录流。精确定位记录、读取上下文和语义检索是不同操作。
+每一行都先通过 appendEvents 保存对应原始消息，再进行 context 追加。delegate 也遵循同一调用/结果关系，只是结果由 Worker 的独立事件流提供。
 
-### 3.3 数据示例
+每条已完成的语义消息及时写入 Memory；context 可以合并多条新增事件后再保存。必须在下一次模型调用前、turn 结束前建立已确认 checkpoint。普通流式 token delta 只用于展示，消息完成后才生成持久 Message；中断的输出保留不完整状态，不能冒充最终结果。
 
-以下示例沿用本项目的文档工作：user-42 在 dsh 会话中要求“先定义概念模型，再描述 HTTP 接口”。示例标识仅用于说明数据关系。
+最终 Router 答复也必须追加事件及 context。Core 先完成包含最终消息的 checkpoint，再追加引用该 checkpoint 的 turn 终态事件，最后将本轮标记为完成。终态事件是控制记录，不需要为它再生成一份 prompt 快照。UI 可以先展示流式内容，但“已完成并可恢复”以持久确认状态为准。
 
-| 对象 | 示例内容 | Memory 中的位置 |
+### 3.4 贯穿示例
+
+用户在 Router 对话中说：“继续修改 Genvagent 的协议文档，并沿用我在 analytics 项目里确定的文档组织方式。”
+
+| 阶段 | 记录与上下文变化 | Memory 行为 |
 | --- | --- | --- |
-| 原始用户消息 e-101 | 用户对文档结构的明确要求 | stream-dsh-1 的第 101 条记录，owner 为 user-42 |
-| 文件读取结果 e-102 | integration-protocol.md 某个内容版本的文本或 blob 引用 | 同一记录流第 102 条；保存文件内容摘要 |
-| 工作上下文 v8 | 当前目标、e-101 的约束、e-102 的相关片段、待修改章节 | ctx-dsh-1 的不可变版本 v8 |
-| 长期记忆 m-17:r1 | user-42 在本项目要求设计文档按“概念模型→交互→接口”组织 | 私有 memory revision，证据引用 e-101 |
-
-m-17:r1 记录的是明确限定于该项目的要求。后续 pi 会话以同一用户访问同一项目时，可以读取这条私有记忆；其他用户只有在相应内容被授权共享后才能读取。
-
-## 4. 同步、读取与检索流程
-
-### 4.1 写入路径
-
-Host Adapter 从 Host 已完成且可持久恢复的记录中提取用户消息、模型输出和工具结果。Harness 为每条记录建立稳定的事件 ID 和记录流序号，将映射写入本地同步日志，然后通过 Memory Client 批量发送。
-
-Memory API 验证用户身份、binding 所有权和有效 writer；Record Store 在一个数据库事务中保存正文引用、事件序号及接收进度。服务返回“已接收至序号 N”后，Harness 才更新本地同步位置。超时重试沿用同一批次标识。
-
-小型 JSON 正文直接存储；超过协议上限的内容先上传 blob，再在记录中引用。大文件的本地路径只能作为来源说明，不能代替服务端可读取的正文。新记录持久化后即可读取，不依赖后台记忆提取。
-
-### 4.2 精确读取与搜索路径
-
-| 操作 | 已知条件 | 服务端执行位置与结果 |
-| --- | --- | --- |
-| 读取已知记录 | eventId，或 streamId 与序号范围 | Record Store 按键返回原始正文 |
-| 恢复已知上下文 | bindingId → contextId → active versionId | Context Store 返回该不可变版本 |
-| 读取已知记忆 | memoryId 与 revision | Memory Store 返回对应修订及状态 |
-| 搜索相关材料 | 问题、project、当前 binding、检索集合 | Memory Retrieval 查询索引，验证权威数据后返回内容和来源 |
-
-搜索在 Memory 服务端完成。Memory Client 发送查询，Retrieval 先按 scope、有效用户、可见性和会话分支限制候选，再做关键词召回；后续可以加入向量检索和重排。返回前校验记录是否仍存在、是否过期或被撤回。Harness 只负责提出查询及选择返回材料，不直接访问 Memory 的数据库或索引文件。
-
-协议将检索集合划分为：branch_records（当前分支及其固定继承范围）、project_memories（当前项目内该用户可读的私有及共享长期记忆）、project_records（显式选择的、当前用户有权读取的跨会话原始记录）。集合选择不能扩大访问权限。
-
-默认从当前分支记录和可见长期记忆中检索。恢复会话时优先按标识精确读取；不能通过“搜索一段类似历史”判断应恢复哪个会话。
-
-### 4.3 后台整理与反馈
-
-Memory Agent 读取已提交的记录，提出带证据的 MemoryRevision，验证后发布。Harness 可以提交用户纠正或使用反馈；Memory 再据此修订知识并发布更新/失效通知。当前用户的明确要求由 Harness 立即纳入工作上下文，不等待 dreaming。
-
-后台 note 不改变任何活动上下文的当前指针。Harness 在后续请求边界读取更新，再决定是否生成新的工作上下文版本。
-
-## 5. 执行与恢复时序
-
-### 5.1 正常执行
-
-以下时序采用支持上下文改写、持久应用标记与请求阻塞的 Adapter，并启用 strict 模式。继续第 3.3 节的示例：记录流此前已接收至 100，当前上下文 v7 已纳入前 100 条记录。
-
-1. Adapter 读取 user-42 的 dsh 会话身份，解析既有 binding b-dsh-1，并获取当前插件实例的写入所有权。
-2. Harness 同步 e-101 与 e-102；Memory 确认 acceptedThrough = 102。
-3. Harness 按当前分支与项目记忆范围检索文档组织要求；当前用户消息 e-101 作为必需输入保留，空检索结果不影响该显式要求。
-4. Context Controller 生成 v8，包含目标、约束、文档片段和修改计划，记录 coveredEventSequence = 102；Memory 将 v8 保存为候选。
-5. Adapter 将 v8 应用到 Host 的下一请求视图，持久化应用标记，再提交激活确认。Memory 将当前指针从 v7 更新到 v8。
-6. Host 执行模型调用和文件修改工具。Harness 将模型输出 e-103、工具结果 e-104 同步到 Memory；它们属于下一次上下文更新应纳入的增量。
+| 接收请求 | Router 创建 turn，追加 user Message | 保存原始请求，不要求为对话选择唯一 project |
+| 检索 | Router 读取用户级偏好、analytics notes、Genvagent notes | 在同一 user 域跨项目检索 |
+| 分派 | Router 产生文档修改任务，Worker 使用独立 context | 保存任务与分派依据，Worker 只取得所需资料 |
+| 执行 | Worker 追加读取文件、修改文件的工具交换 | 每个完成的消息及时保存；请求前提交 context |
+| 回传 | Worker 输出结果；Router 追加对应结果消息 | 保留两条流及结果来源关系 |
+| 答复 | Router 输出总结，追加最终消息并结束 turn | 保存 Router 最终 context 与 turn 终态 |
+| 后台整理 | Worker 可提议 Genvagent 项目 note | Memory 校对后发布；不自动把项目要求变成全局偏好 |
 
 ```mermaid
 sequenceDiagram
-    participant H as Host
-    participant G as Genvagent Harness
-    participant A as Memory API
-    participant S as Record / Context Store
-    participant R as Memory Retrieval
-    H->>G: 已提交的消息与工具记录
-    G->>A: 同步 e-101、e-102
-    A->>S: 事务保存记录与接收进度
-    S-->>A: 提交完成
-    A-->>G: acceptedThrough = 102
-    G->>A: 查询可见记录与长期记忆
-    A->>R: 按访问范围检索
-    R-->>A: 相关内容、修订和证据引用
-    A-->>G: 检索结果
-    G->>A: 保存候选上下文 v8
-    A->>S: 写入不可变 ContextVersion
-    G->>H: 应用工作视图并保存标记
-    H-->>G: 应用结果
-    G->>A: 提交 v8 的应用确认
-    A->>S: 更新当前版本指针
-    H->>H: 执行模型与工具
-    H->>G: 模型输出 e-103、工具结果 e-104
-    G->>A: 同步执行结果
+    participant U as User
+    participant C as Harness Core
+    participant R as Router Runtime
+    participant W as Worker Runtime
+    participant M as User Memory
+    U->>C: submitUserMessage
+    C->>M: appendEvents(user message)
+    C->>C: appendMessages for active turn
+    C->>M: getUserOverview + recall
+    C->>M: putContext + activateContext
+    C->>R: invokeModel
+    R-->>C: delegate decision
+    C->>M: appendEvents(router decision + task)
+    C->>M: openSession(worker) + appendEvents(assignment)
+    C->>W: drive worker steps through Core
+    W-->>C: model outputs / tool results
+    C->>M: appendEvents + context checkpoints
+    W-->>C: task result
+    C->>M: appendEvents(router result delivery)
+    C->>C: appendMessages(router result)
+    C->>M: putContext + activateContext
+    C->>R: invokeModel
+    R-->>C: final answer
+    C->>M: appendEvents(answer), checkpoint, appendEvents(turn completed)
+    C-->>U: completed answer
 ```
 
-### 5.2 重启的定义与恢复入口
+图中运行时调用前的 context 激活均包含 Driver 的实际应用与 marker 确认；详细调用契约如下。
 
-本文的重启指进程或插件实例重新创建；会话身份和已持久化数据不会因此重新分配。上下文压缩不属于重启。
+## 4. 逻辑接口函数
 
-| 情况 | 丢失的状态 | 恢复入口 |
+接口先按调用方向定义。下列函数名是 Genvagent 的拟定契约，既不是 dsh/pi 已有 SDK，也不要求调用方直接操作数据库。
+
+### 4.1 应用、Core 与运行时
+
+| 调用方向 | 函数 | 语义 |
 | --- | --- | --- |
-| Host 进程退出后重新运行 | Host 与插件的内存状态 | 用户通过 Host 恢复原 session，Adapter 取得原 session/branch 标识 |
-| 插件 reload | Harness Core 内存和连接 | 仍在运行的 Host 提供当前 session/branch 标识 |
-| Memory API 实例重启或切换节点 | API 实例内存与连接 | 客户端重连相同服务 endpoint；从共享持久存储读取原绑定和版本 |
+| UI/Host → Core | openConversation(registration) | 按 SessionRegistration 创建或恢复 Router conversation，取得持久绑定 |
+| UI/Host → Core | submitUserMessage(routerBindingId, inputId, content) | 持久化输入并创建或取得同一 turn；返回 turn handle |
+| UI/Host → Core | cancelTurn(turnId) | 记录取消意图，停止安排新 step，通知运行时取消可取消动作 |
+| Driver → Core | acceptCompletion(actionId, completion) | 提交模型、工具或 Worker 完成结果，按动作 ID 去重 |
+| Core 内部 | advance(bindingId) | 根据持久状态选择下一动作：调用模型、执行工具、分派、等待或结束 |
+| Core → ContextController | appendMessages(committedEvents) | 将已提交消息应用到工作副本，推进消费位置 |
+| Core → ContextController | buildContext(bindingId, recalledItems) | 组装并校验候选版本，不执行模型 |
+| Core → Driver | applyContext(plan) | 应用工作视图，返回可恢复应用回执 |
+| Core → Driver | ensureWorker(task) | 按 taskId 创建或定位尚未开始模型执行的 Worker session |
+| Core → Driver | execute(action) | 只执行 invoke_model / execute_tool；结果经 acceptCompletion 回流 |
 
-Host 与插件的本地持久目录保存恢复所需的安装标识、会话定位信息和同步索引。这里只承诺在这些数据仍可取得时恢复同一执行会话；Host 会话存档或执行环境完全丢失时，能读取 Memory 内容并不代表能复原原有进程和工具状态。
+Core 的 advance 是逻辑 loop 的状态转换入口；调用模型与工具的底层 SDK 可由 Host 提供。dispatch_task 由 Core 的 Task Controller 处理，wait 和 finish 由 Core 更新状态；只有模型与工具动作交给 Driver.execute。Driver 不能在 Core 仍等待保存确认或必要工具结果时自行进入下一模型 step。
 
-### 5.3 确定性恢复步骤
+### 4.2 Core → Memory 的主接口
 
-1. **取得身份。** Adapter 从 Host 得到 nativeSessionId、nativeBranchId；从配置取得 scope 和持久 hostInstanceId。有效用户由认证信息确定。
-2. **定位 binding。** 本地会话映射按上述身份和 ownerUserId 查出 bindingId。映射丢失但这些身份仍可取得时，使用 bindings:resolve 按相同唯一键查询服务端；不会新建或模糊匹配会话。
-3. **读取进度。** 按 bindingId 读取 streamId、acceptedThrough、contextId、当前 ContextHead 和应用回执。重新获取 writer lease，不能复用上个进程的过期租约。
-4. **核对应用状态。** 比较本地应用标记和 Memory receipt。若上次已在 Host 应用而激活确认未完成，按原请求标识核对或补交；在状态确定前不执行下一受管理步骤。
-5. **补传记录。** 从 Host 会话存档或插件持久同步日志中导出尚未确认的记录，沿用原事件 ID 与序号补传。同步不会重放工具调用。
-6. **读取上下文及增量。** 按当前 ContextRef 精确读取版本，再读取该版本 coveredEventSequence 之后的已提交记录。若当前为 v8、覆盖至 102，而 Memory 已接收至 104，则增量为 e-103、e-104。尚无激活版本时，从空视图和全部已提交记录构建。
-7. **生成下一版本。** Harness 将增量、最新用户要求与当前 Host 配置合并，校验消息格式和工具结果，再走候选保存与激活流程。
+Memory Client 绑定有效 userId。函数中的项目过滤只缩小查询，不能替换用户身份；所有返回内容都属于该用户的统一 Memory。
 
-“既有记录”在这里特指同一 binding 对应记录流中已经提交的事件；“既有上下文”特指该 binding 的 ContextHead 引用的版本。恢复依据持久身份、版本引用和序号，不依赖模型推测。
-
-## 6. 持久化与一致性约束
-
-| 约束 | 具体含义 |
-| --- | --- |
-| 数据持久性 | Memory 仅在记录和引用正文均持久化后确认接收 |
-| 幂等性 | 同一事件批次或激活请求重试，返回原结果，不追加第二份逻辑数据 |
-| 写入所有权 | 一个 binding 同时只有一个有效 writer；旧进程不能覆盖新进程提交的进度 |
-| 版本一致性 | 候选基于明确的旧版本；提交时比较版本，冲突后重新构建 |
-| 用户与分支隔离 | scope、owner、可见性和分支范围共同限制读取，项目相同不意味着私有数据共享 |
-| 执行可追溯性 | 上下文持久化、Host 应用和模型/工具执行分别记录 |
-| 授权持续有效 | 历史版本读取同样检查当前授权与删除状态 |
-
-Host 保存的会话存档、工具执行记录和执行环境，由 Host 自己的恢复机制处理。Memory 的确认不能代替工具成功回执，也不授权恢复时再次执行外部操作。
-
-## 7. 概念到接口的映射
-
-| 对象或交互 | 主要标识 | 接口类别 |
+| 函数 | 输入 | 输出与提交语义 |
 | --- | --- | --- |
-| 用户、项目、访问范围 | userId、Scope、AccessPolicy | 认证上下文与资源权限检查 |
-| Host 会话与 Memory 关联 | SessionBinding、bindingId | 注册、按身份解析、按 ID 读取 |
-| 原始记录同步 | streamId、sequence、eventId | 批量追加、范围读取、按事件 ID 读取 |
-| 长期记忆检索 | corpus、query、EvidenceRef | recall、修订读取、反馈 |
-| 工作上下文保存 | contextId、versionId | 不可变版本写入与读取 |
-| 工作上下文生效 | ContextHead、HostApplicationReceipt | 激活、版本比较、应用确认 |
-| 临时写入所有权 | WriterLease、epoch | 获取、续租、释放 |
-| 知识修订通知 | change ID、cursor | 变更分页读取 |
+| openSession | SessionRegistration | BindingState；创建或返回同一持久关联，分配 stream/context |
+| resolveSession | SessionKey | BindingState；按原身份精确查找，不新建 |
+| getSession | bindingId | 当前绑定、接收位置、context head、应用回执和 writer |
+| updateLease | bindingId、LeaseRequest | writer lease 或释放确认 |
+| appendEvents | bindingId、AppendRequest、写入凭证 | AppendReceipt；整批持久化后返回 acceptedThrough 与 userRevision |
+| readEvents | bindingId、afterSequence、limit | 连续事件分页；用于恢复和来源读取 |
+| getUserOverview | cursor、minUserRevision | 用户 notes 与所有项目/会话/任务的可分页目录，不限定 project |
+| recall | RecallRequest | 带来源、revision 和可信状态的 RecallResponse |
+| readEvidence | EvidenceRef | 精确读取事件或 note 修订，沿用当前授权与删除检查 |
+| putContext | bindingId、ContextVersion、写入凭证 | 已持久化候选版本；不推进当前指针 |
+| getContext | ContextRef | 该不可变版本及正文 |
+| activateContext | bindingId、ActivateRequest、写入凭证 | 新 ContextHead；与应用 receipt 原子提交 |
+| proposeNote | NoteProposal | proposal ID 与持久化确认；发布结果由后台校验确定 |
+| submitFeedback | FeedbackInput | feedback ID；先保存反馈，再触发整理 |
+| readChanges | cursor、limit | 用户域内 notes、来源与任务变更；按 change ID 去重 |
 
-首版采用 HTTP + JSON，路径前缀为 /v1。Memory Client 是 Harness 的服务访问模块；单机与集群仅改变服务 endpoint，不改变对象标识和接口语义。MCP 可提供模型调用检索的入口，会话同步与上下文应用仍由 Host Adapter 接入。
+userId 从认证或授权委托确定；绑定一个 user 的客户端不能读另一个 user 的对象。Router 可发现全部用户资料，Worker 使用与 task 绑定的读取授权。Core 持有用户凭据，模型只调用受控工具，不接触凭据。
 
-## 8. 数据结构与操作语义
+### 4.3 接口调用顺序
 
-下列类型由 protocol 包定义，分别对应第 2–7 节的数据对象与交互。其他文档引用同一份类型。
+```text
+启动：
+  resolveSession / openSession → getSession → updateLease(acquire)
+  → 核对 marker 与 head → 补传事件 → getContext + readEvents
 
-### 8.1 共享范围与会话关联
+处理消息：
+  appendEvents → appendMessages
 
-共享范围限定数据分区，访问策略限定用户可见性；会话关联将 Host 分支对应到持久记录流与工作上下文。较大正文使用内容引用传输。
+准备一次模型调用：
+  getUserOverview / recall → buildContext → putContext
+  → applyContext → activateContext → execute(invoke_model)
+
+模型或工具完成：
+  acceptCompletion → appendEvents → appendMessages → advance
+
+本轮结束：
+  appendEvents(final answer) → appendMessages
+  → buildContext → putContext → applyContext → activateContext
+  → appendEvents(turn completed, checkpoint ref) → 发布完成状态
+
+提出项目 note：
+  proposeNote → Memory 验证与发布 → readChanges / recall 读取新修订
+```
+
+getUserOverview 不要求每 step 全量读取；Core 可按 user revision 与 changes 缓存目录。用户明确要求立即进入本轮上下文，不等待 note 提取完成。
+
+## 5. 共享数据结构
+
+### 5.1 身份、引用与会话
 
 ```typescript
 type ID = string;
-type Timestamp = string;          // UTC ISO 8601
+type Timestamp = string;
 type JsonValue = null | boolean | number | string
   | JsonValue[] | { [key: string]: JsonValue };
 
-interface Scope {
-  workspaceId: ID;
-  projectId: ID;
+interface UserDomain {
+  userId: ID;                     // 唯一 Memory 归属域；project 不在域键中
 }
 
-interface AccessPolicy {
-  ownerUserId: ID;                // 数据归属用户，由认证或已授权委托校验
-  visibility: "private" | "project";
-}
+type NoteScope = { kind: "user" }
+  | { kind: "project"; projectId: ID };
 
 interface BlobRef {
   blobId: ID;
@@ -273,43 +270,40 @@ interface BlobRef {
 type Content = { type: "inline"; value: JsonValue }
   | { type: "blob"; ref: BlobRef };
 
-type EvidenceRef = { kind: "event"; eventId: ID }
-  | { kind: "memory"; memoryId: ID; revision: number };
+type EvidenceRef = { kind: "event"; bindingId: ID; eventId: ID }
+  | { kind: "note"; noteId: ID; revision: number };
 
 interface ContextRef {
   contextId: ID;
-  versionId: ID;                  // 不可变版本 ID；不是可移动的 latest 指针
+  versionId: ID;
 }
 
-interface SessionBinding {
-  bindingId: ID;
-  scope: Scope;
-  access: AccessPolicy;           // 原始记录与工作上下文继承此策略
-  host: "dsh" | "pi" | "other";
-  hostVersion: string;
-  hostInstanceId: ID;
+type ReadGrant = { kind: "user" }
+  | { kind: "task"; taskId: ID; projectIds: ID[]; refs: EvidenceRef[] };
+
+interface SessionKey {
+  hostInstanceId: ID;             // 安装实例的持久标识
   nativeSessionId: string;
   nativeBranchId: string;
+}
+
+interface SessionRegistration {
+  key: SessionKey;
+  host: "dsh" | "pi" | "standalone" | "other";
+  hostVersion: string;
+  agentRole: "router" | "worker";
+  conversationId: ID;
+  taskId?: ID;
+  projectId?: ID;                 // 任务标签，不改变 Memory 所属域
+  readGrant: ReadGrant;
+  parentContext?: ContextRef;     // 同 agent 分支继承，不用于复制 Router 给 Worker
+}
+
+interface SessionBinding extends SessionRegistration {
+  bindingId: ID;
+  domain: UserDomain;
   streamId: ID;
   contextId: ID;
-  parentContext?: ContextRef;
-}
-```
-
-`hostInstanceId` 是 Host 安装实例的持久标识；临时连接使用另一个 owner ID。项目映射由配置指定，不能根据相同的本地目录名自动合并项目。Binding 的 scope 和 owner 创建后不可改绑，默认 visibility 为 private；共享策略变更由受授权的管理操作处理。
-
-绑定唯一键为 `(scope, access.ownerUserId, hostInstanceId, nativeSessionId, nativeBranchId)`。注册重试返回相同绑定。Host 分支、fork、回退后形成新执行分支时创建新 binding 和 stream，显式引用当时的 parentContext，不能复用旧分支的写指针或读取它后来的事件。
-
-鉴权在服务层确定有效 userId 和允许的 scope；服务账号代用户访问须具有委托权限。每个对象 ID 和来源引用均检查 owner/visibility。请求正文不能覆盖有效用户，也不能将私有内容扩大为项目共享。API 凭据不进入事件、上下文或模型输入。
-
-本地索引失效时，`POST /v1/bindings:resolve` 接收 scope、hostInstanceId、nativeSessionId 和 nativeBranchId，按认证确定的 ownerUserId 精确查询绑定。它是只读查询，缺失时返回 NOT_FOUND；明确的新会话由注册接口创建。
-
-```typescript
-interface BindingLookup {
-  scope: Scope;
-  hostInstanceId: ID;
-  nativeSessionId: string;
-  nativeBranchId: string;
 }
 
 interface BindingState {
@@ -321,61 +315,42 @@ interface BindingState {
 }
 ```
 
-注册、按 ID 读取和 resolve 均返回 BindingState；进度与当前指针来自同一数据库读取视图。activeReceipt 对应当前 activeVersion，首次激活前两者都不存在；它与 Host 的本地 marker 一起用于恢复核对。
+绑定唯一键为 (userId, hostInstanceId, nativeSessionId, nativeBranchId)，不包含 project。Router 对话切换项目不会重新分配 Memory；fork 或形成新执行分支才建立新 binding。worker 的 taskId 必填，其 readGrant 必须对应同一任务。
 
-### 8.2 能力协商与写入所有权
+ReadGrant 由有权委派任务的 Core 注册，Worker 凭证绑定其 binding，不能自行提升为 user 范围。task 授权允许读取自己的记录、选定 refs 和指定项目 notes；用户级 notes 通过选定 refs 提供。引用某条来源不自动授权读取来源所属的整个会话。worker 来源请求仍由服务端校验，body 中的角色字段不构成授权。
 
-先确认两侧支持的协议与上下文格式，再为当前插件实例分配写入所有权；这落实第 6 节关于旧执行者不能覆盖新进度的要求。
-
-`GET /v1/capabilities` 返回协议版本、支持的 context formats、可选 features、批量事件和 inline payload 大小上限。主版本不兼容时停止连接；小版本只增加可选字段或能力。必需能力缺失时明确拒绝对应运行模式。
+### 5.2 消息、事件与同步
 
 ```typescript
-interface ServerCapabilities {
-  protocolMajor: number;
-  protocolMinor: number;
-  contextFormats: string[];
-  features: string[];
-  maxInlineBytes: number;
-  maxBatchEvents: number;
+interface ToolCall {
+  toolCallId: ID;
+  name: string;
+  arguments: JsonValue;
 }
 
-interface WriterLease {
-  bindingId: ID;
-  ownerId: ID;                    // 当前插件实例，不是用户身份
-  epoch: number;
-  expiresAt: Timestamp;           // 以服务端时间为准
+interface Message {
+  messageId: ID;
+  speaker: "user" | "assistant" | "tool";
+  content: Content;
+  toolCalls?: ToolCall[];
+  inReplyToToolCallId?: ID;
+  completeness: "complete" | "interrupted";
 }
 
-type LeaseRequest =
-  | { action: "acquire"; ownerId: ID; requestedTtlSeconds: number }
-  | { action: "renew"; ownerId: ID; epoch: number; requestedTtlSeconds: number }
-  | { action: "release"; ownerId: ID; epoch: number };
-```
-
-一个 binding 同时只有一个有效 writer。客户端通过 lease 接口获取、续租或释放；新 owner 只能在旧租约释放或过期后获取更高 epoch。所有事件写入、上下文准备与激活携带 lease，服务端在提交事务中验证 epoch 与有效期。
-
-acquire/renew 返回 WriterLease，release 返回 released 确认。requestedTtlSeconds 是客户端请求，服务端可按上限缩短；客户端以响应中的 expiresAt 安排续租。renew/release 必须同时匹配 ownerId 与 epoch。
-
-lease 只控制 Memory 写入，不代表远程控制 Host 进程。插件丢失租约后必须停止 Memory 写入；strict 模式还停止新的受管理模型步骤和上下文修改，buffered 模式按第 11 节保留本地进度。已经开始的外部工具仍由 Host 管理。需要多个并行 agent 时，为每个执行分支创建独立 binding。
-
-### 8.3 原始记录与同步位置
-
-记录同步保留 Host 事件身份，并维护 Memory 已接收的连续事件位置，支持幂等写入和断线补传。
-
-#### 8.3.1 事件结构
-
-```typescript
 interface RecordInput {
   eventId: ID;
-  sequence: number;               // 当前 stream 内，从 1 开始连续递增
-  nativeEventId: string;
-  nativePosition: JsonValue;      // Host 序号或树节点位置，保持为 opaque 数据
-  kind: "message" | "tool_call" | "tool_result" | "observation"
-    | "model_request" | "model_result" | "context_marker" | "feedback";
-  producer: "user" | "host" | "agent";
-  actorId: ID;                    // 与 producer 对应的实际用户、Host 或 agent 身份
+  sequence: number;               // binding 的 stream 内从 1 连续递增
+  originId: string;               // 原生事件或 Core 事件的稳定去重 ID
+  nativePosition?: JsonValue;
+  kind: "message" | "task_created" | "task_result" | "turn_state"
+    | "step_state" | "observation" | "context_patch" | "feedback";
+  actor: { role: "user" | "router" | "worker" | "runtime"; id: ID };
+  turnId: ID;
+  taskId?: ID;
+  stepId?: ID;
+  projectId?: ID;
   occurredAt: Timestamp;
-  content: Content;
+  payload: Content;              // message 类型解引用后符合 Message
   sourceRefs: EvidenceRef[];
 }
 
@@ -386,48 +361,57 @@ interface AppendRequest {
 
 interface AppendReceipt {
   acceptedThrough: number;
-  projectRevision: number;
+  userRevision: number;
+}
+
+interface EventPage {
+  records: RecordInput[];
+  nextSequence: number;
+  hasMore: boolean;
 }
 ```
 
-`POST /v1/streams/{streamId}/events:append` 原子接受一个批次。新批次的 afterSequence 必须等于服务端已接收位置，序号不能跳跃。eventId 在 scope 内唯一，nativeEventId 在 stream 内唯一；相同内容重复发送不产生第二条事件，同一标识对应不同内容则报错。
+消息和操作状态分别记录。step_state 记录模型调用使用的 ContextRef、actionId 和请求/结果状态；不会再次存储一份重复的 assistant Message。task_result 可携带投递给 Router 的 tool Message，其 inReplyToToolCallId 匹配 delegate 调用。
 
-记录的所有权来自 stream 对应 binding 的 AccessPolicy，producer/actorId 只描述实际产生者。API 验证产生者声明与已认证的 Host 或委托身份，不能用 actorId 改变数据归属。
+eventId 在 user 域唯一，originId 在 binding 内唯一。appendEvents 原子接受批次，afterSequence 必须匹配当前已接收位置。Core 在发送前持久化事件映射、请求正文与幂等 key；未知结果用原 key 重试。消息产生者不改变 user 归属。
 
-客户端先将 nativeEventId、sequence、eventId 的映射写入本地持久同步日志，再发送，插件重新加载后复用。传输 sequence 表示规范化事件流顺序；Host 并行工具的实际关联与因果关系保留在 nativePosition/content 中，不能靠网络到达时间重建。
-
-服务端确认意味着事件和引用内容已持久化。批次成功而响应丢失时，用原 Idempotency-Key 重试得到原 receipt。读取绑定状态也能核对 acceptedThrough；不从内存计数器推断进度。
-
-#### 8.3.2 原始材料与派生信息
-
-保存最终消息和工具结果，流式 token delta 默认不作为独立语义记录。必要的供应商私有字段可以放在带 host format 的 opaque content 中；它们能否恢复由 adapter 决定。
-
-生成的摘要标明 producer 与 sourceRefs，不能伪装成用户原话或工具原始结果。工作上下文的修改不会覆盖这些事件。历史读取使用 `GET /v1/streams/{streamId}/events?after=...&limit=...`，返回连续分页及 nextSequence。已知 eventId 时使用 `GET /v1/events/{eventId}?workspaceId=...&projectId=...` 在指定 scope 内精确读取；服务端通过事件所属 stream 校验访问策略。
-
-### 8.4 工作上下文版本与应用确认
-
-**“已保存候选”“Host 已应用”“模型已调用”是三个不同事实。** 采用不可变 ContextVersion 和可移动 ContextHead，避免把一次存储成功误报为上下文已经生效。
+### 5.3 上下文版本与应用确认
 
 ```typescript
+interface WorkingBlock {
+  id: ID;
+  category: "goal" | "constraint" | "note" | "evidence"
+    | "progress" | "message" | "tool_exchange";
+  content: Content;
+  sourceRefs: EvidenceRef[];
+  editable: boolean;
+}
+
+interface WorkingContext {
+  format: "genvagent.context.v1";
+  goal: string;
+  blocks: WorkingBlock[];
+}
+
 interface ContextVersion {
   ref: ContextRef;
   basedOnHeadRevision: number;
-  format: string;                 // 如 genvagent.context.v1 或已协商的 native format
+  format: string;
   body: Content;
-  bodyHash: string;               // 协议规定的规范化表示的 SHA-256
-  coveredEventSequence: number;   // 已处理的连续事件前缀，序号相对本 binding
+  bodyHash: string;
+  coveredEventSequence: number;
   sourceRefs: EvidenceRef[];
-  recalledAtRevision: number;
+  recalledAtUserRevision: number;
 }
 
 interface ContextHead {
   contextId: ID;
-  revision: number;               // 第一次激活前为 0
+  revision: number;
   activeVersion?: ContextRef;
 }
 
 interface HostApplicationReceipt {
-  markerId: string;               // Host 持久 marker，恢复时可再次读取
+  markerId: ID;
   nativePosition: JsonValue;
   appliedBodyHash: string;
   coverage: "working_view" | "model_messages" | "provider_payload";
@@ -440,43 +424,38 @@ interface ActivateRequest {
 }
 ```
 
-#### 8.4.1 一次更新的顺序
+coveredEventSequence 表示 Core 已处理的连续事件前缀。非消息状态事件推进消费位置但不一定产生 prompt 文本；已压缩消息通过来源引用保留。不可直接把 acceptedThrough 复制为 coveredEventSequence。
 
-1. Harness 将新输入同步至 Memory，取得 acceptedThrough。
-2. 检索证据，读取当前 ContextHead，构建候选工作视图。受保护指令与工具协议由 Harness/adapter 校验。
-3. `PUT /v1/contexts/{contextId}/versions/{versionId}` 保存候选。服务端检查输入已存在、来源可访问、格式受支持以及 base revision。
-4. adapter 在 Host 支持的安全边界应用候选，写入并持久化包含 ContextRef、bodyHash 和 Host 位置的 marker。
-5. `POST /v1/contexts/{contextId}:activate` 以 expectedHeadRevision 和 writer epoch 提交。服务端重新检查权限与来源删除状态，原子推进 head 并保存 receipt；候选、receipt 的 hash 必须匹配，expectedHeadRevision 必须等于候选 basedOnHeadRevision。
-6. 收到确认后放行受管理的模型请求。模型请求与结果另记事件，不能由 activation 推断已调用模型。
+候选版本已经组装但尚未完成应用确认。putContext 不改变 head；Driver 应用并持久化 marker 后，activateContext 比较 head revision、writer epoch 和 bodyHash，原子保存 receipt 并推进 head。
 
-这是可恢复的分步协议，不是跨 Host 和 Memory 的分布式事务。prepare 不改变 active head。activate 的重复调用返回首次结果；旧 head、旧 lease 或不匹配 receipt 被拒绝。
+工作视图 checkpoint 可以包含尚未完成的工具调用；下一次模型请求前必须满足该 Host 的工具交换要求。模型调用引用当时激活的 ContextRef，后续追加结果形成新版本，不能据最终 context 反推之前模型看到了什么。
 
-`coveredEventSequence` 只能覆盖已实际吸收的连续事件前缀；被移出视图的历史通过来源引用保留。候选保存后新增输入不会被自动视为已处理，下一次编译仍需合并。
+Host 的系统指令、工具定义、授权和当前用户约束保持受保护。实际捕获到 working_view、完整 model_messages 或 provider_payload，应按 receipt.coverage 如实记录；供应商凭据不进入快照。
 
-放行前 adapter 再次检查 Host 位置与取消状态。如果准备后到达用户纠正或发生分支切换，应重新构建候选；不能通过激活旧视图把这些输入标记为已处理。
-
-#### 8.4.2 输入覆盖与真实生效
-
-`working_view` 表示确认了插件管理的工作区域，`model_messages` 表示捕获了完整模型消息，`provider_payload` 表示捕获了供应商实际请求 payload。请求快照不包括鉴权头。
-
-adapter 必须声明能确认的覆盖层次，不能把早期 hook 中的候选称为最终 provider payload。其他插件或 Host 后处理仍可能改变请求；若不能在最后阶段捕获，保存原生记录以便核对，并仅宣称已验证的覆盖范围。
-
-如果 Host 只支持追加注入，则启用 recall 模式，不开放需要任意替换的 CLM 功能。不能持久化 marker 或在 Memory 确认前阻止请求的 adapter，不能宣称支持本节的 strict 恢复保证。
-
-### 8.5 知识读取与反馈
-
-知识读取返回带来源、修订和可信状态的检索结果。反馈引用具体证据与记忆版本，供后台验证和修订；最终工作上下文由 Harness 组织。
+### 5.4 用户概览、检索与 notes
 
 ```typescript
+interface UserOverview {
+  userRevision: number;
+  entries: {
+    kind: "user_note" | "project" | "conversation" | "task";
+    id: ID;
+    label: string;
+    summary?: string;
+    sourceRefs: EvidenceRef[];
+  }[];
+  nextCursor?: string;
+}
+
 interface RecallRequest {
-  scope: Scope;
   bindingId: ID;
-  corpora: ("branch_records" | "project_memories" | "project_records")[];
   query: string;
+  corpora: ("user_notes" | "project_notes" | "session_events" | "user_events")[];
+  projectIds?: ID[];              // 未指定时不按 project 过滤；空数组无项目匹配
   requiredRefs: EvidenceRef[];
-  minProjectRevision?: number;
+  minUserRevision?: number;
   maxItems: number;
-  maxBytes: number;                // 最终 token 预算由 Harness 按实际模型计算
+  maxBytes: number;
 }
 
 interface RecallItem {
@@ -489,144 +468,178 @@ interface RecallItem {
 }
 
 interface RecallResponse {
-  readRevision: number;
+  readUserRevision: number;
   items: RecallItem[];
   missingRequiredRefs: EvidenceRef[];
 }
+
+interface NoteProposal {
+  proposalId: ID;
+  producerBindingId: ID;
+  scope: NoteScope;
+  noteId?: ID;
+  expectedRevision?: number;
+  content: Content;
+  sourceRefs: EvidenceRef[];
+}
+
+interface FeedbackInput {
+  feedbackId: ID;
+  sourceEvent: EvidenceRef;
+  target: EvidenceRef;
+  kind: "correction" | "stale" | "useful" | "rejected";
+}
 ```
 
-`POST /v1/recall` 返回带证据与状态的材料，最终取舍与 prompt 编排属于 Harness。`GET /v1/memories/{memoryId}?revision=...` 精确读取历史修订。revision 必须保存在使用记录中，不用 latest 引用代替历史证据。
+Router 默认搜索 user_notes、project_notes、当前 session_events；需要跨会话证据时显式加入 user_events。项目筛选作用于项目 notes 和带项目标签的事件，不排除 user_notes。Worker 的请求还受 ReadGrant 限制。
 
-默认使用 branch_records 与 project_memories：前者限定当前分支及其固定继承范围；后者包含该项目内当前用户可读的私有和 project 可见记忆。project_records 显式搜索可访问的跨会话原始记录。所有集合在召回和返回前均执行 owner/visibility 检查；查询参数不能扩大访问范围。
+检索在 Memory 的索引与存储层完成。requiredRefs 直接读取，不与相关性分数竞争。索引落后于 minUserRevision 时补读权威存储，或在 deadline 后返回 NOT_READY，不能返回遗漏必需新输入的成功结果。
 
-minProjectRevision 约束可见数据范围。索引落后时服务端补读权威存储，或等待到请求 deadline 后明确返回 NOT_READY；不能返回成功但遗漏已确认的必需输入。readRevision 不证明所有旧 notes 仍然正确，单条记忆的 stale/epistemicStatus 仍须保留。
+proposeNote 将候选持久化，由 Memory 验证后发布不可变 NoteRevision。项目 Worker 可提出该项目的 note；提升为 user 级记忆由 Router 或 Memory Agent 判断适用范围并校验。未发布候选不进入普通 recall。
 
-用户纠正以原始事件先保存，并由 Harness 立即更新本轮约束。`POST /v1/feedback` 引用该 eventId、目标 memory revision，以及 `correction | stale | useful | rejected` 类型，触发后台整理。agent 自评 useful 不直接提升事实可信度。
+### 5.5 并发与能力
 
-`GET /v1/changes?scope=...&after=...` 返回访问范围内的 memory.updated、memory.invalidated、source.deleted 等变更、opaque nextCursor 和 hasMore。投递至少一次，客户端按 change ID 去重；游标过期返回 410，客户端重新读取当前记忆状态。SSE 是可选加速，周期拉取是基础能力。
+```typescript
+interface WriterLease {
+  bindingId: ID;
+  ownerId: ID;                    // 插件/Runner 实例，不是 userId
+  epoch: number;
+  expiresAt: Timestamp;
+}
 
-## 9. HTTP 接口清单
+type LeaseRequest =
+  | { action: "acquire"; ownerId: ID; requestedTtlSeconds: number }
+  | { action: "renew"; ownerId: ID; epoch: number; requestedTtlSeconds: number }
+  | { action: "release"; ownerId: ID; epoch: number };
 
-所有写入使用 `Idempotency-Key`；recall 和 bindings:resolve 虽采用 POST，语义上是只读查询。事件写入、上下文准备与激活还携带 `X-Genvagent-Writer-Id` 和 `X-Genvagent-Writer-Epoch`；首次注册不要求已有 lease，lease 操作按 LeaseRequest 检查。具体认证值通过 Authorization 传输。服务端不接受跨 scope 的引用。
+interface ServerCapabilities {
+  protocolMajor: number;
+  protocolMinor: number;
+  contextFormats: string[];
+  features: string[];
+  maxInlineBytes: number;
+  maxBatchEvents: number;
+}
+```
 
-| 接口 | 返回与边界 |
+每个 binding 同时只有一个 writer，Router 与各 Worker 可独立写入。新的实例在旧 lease 释放或过期后取得更高 epoch。该约束不把整个用户的在线执行串行化。
+
+## 6. HTTP 映射
+
+所有域内路径以 `/v1/users/{userId}` 为前缀，服务端核对有效用户或委托身份。以下以 P 代表此前缀。写操作使用 Idempotency-Key；事件写入、context 保存与激活携带 writer ID 和 epoch。
+
+| 逻辑函数 | HTTP |
 | --- | --- |
-| `GET /v1/capabilities` | ServerCapabilities |
-| `PUT /v1/bindings/{bindingId}` | 注册 Host 会话映射，返回 BindingState；已存在时核对配置 |
-| `GET /v1/bindings/{bindingId}` | BindingState，含当前版本的应用回执 |
-| `POST /v1/bindings:resolve` | BindingLookup → BindingState；按有效用户与 Host 身份精确查询，不创建绑定 |
-| `POST /v1/bindings/{bindingId}/lease` | acquire/renew/release；返回 WriterLease 或占用错误 |
-| `POST /v1/streams/{streamId}/events:append` | AppendReceipt；批内原子提交 |
-| `GET /v1/streams/{streamId}/events` | 原始事件分页 |
-| `GET /v1/events/{eventId}` | 必须携带 workspaceId、projectId 查询参数；按 scope 和事件 ID 读取正文并鉴权 |
-| `PUT /v1/contexts/{contextId}/versions/{versionId}` | 保存并返回不可变 ContextVersion，未激活 |
-| `GET /v1/contexts/{contextId}/versions/{versionId}` | 精确读取版本 |
-| `GET /v1/contexts/{contextId}/head` | 当前 ContextHead |
-| `POST /v1/contexts/{contextId}:activate` | 新 ContextHead，原子保存应用 receipt |
-| `POST /v1/recall` | RecallResponse |
-| `GET /v1/memories/{memoryId}` | 指定 revision 或当前修订及其状态 |
-| `POST /v1/feedback` | 已持久化的 feedback ID，不保证 dreaming 已完成 |
-| `GET /v1/changes` | 变更分页及 nextCursor |
-| `POST /v1/blobs`、`GET /v1/blobs/{blobId}` | 大内容上传和授权读取，上传后返回 BlobRef |
+| 能力协商 | GET /v1/capabilities |
+| openSession | POST P/sessions |
+| resolveSession | POST P/sessions:resolve |
+| getSession | GET P/sessions/{bindingId} |
+| updateLease | POST P/sessions/{bindingId}/lease |
+| appendEvents / readEvents | POST P/sessions/{bindingId}/events:append；GET P/sessions/{bindingId}/events |
+| getUserOverview | GET P/overview |
+| recall | POST P/recall |
+| readEvidence | GET P/sessions/{bindingId}/events/{eventId}；GET P/notes/{noteId}?revision=... |
+| putContext / getContext | PUT / GET P/contexts/{contextId}/versions/{versionId} |
+| activateContext | POST P/contexts/{contextId}:activate |
+| proposeNote | POST P/note-proposals |
+| submitFeedback | POST P/feedback |
+| readChanges | GET P/changes |
+| 大正文上传/读取 | POST P/blobs；GET P/blobs/{blobId} |
 
-内容在 inline 上限内传 JSON，超过上限先上传 blob。服务端校验 sha256、大小和可见范围；blob 持久化后才能发布引用。未被引用的上传内容允许延迟回收。
+sessions:resolve 和 recall 虽为 POST，但不修改状态。openSession 接收 SessionRegistration，userId 来自路径和认证；按 SessionKey 的唯一约束实现重复注册去重。projectId 不参与 endpoint 或会话唯一键。
 
-DreamJob 的创建、查看和取消是 Memory 自身管理接口，不属于 Harness 必需契约。Host 可以在任务结束时发送 observation，Memory 根据策略自行调度整理。
-
-### 9.1 激活请求示例
-
-假设 ctx-a 当前 head revision 为 7，候选 ver-b 已保存，Host 已持久化 marker-42。以下 hash 用占位值表示；实际请求使用匹配候选正文的真实摘要。
+### 6.1 用户输入事件示例
 
 ```http
-POST /v1/contexts/ctx-a:activate
+POST /v1/users/u-42/sessions/router-session-1/events:append
 Authorization: Bearer <credential>
-Idempotency-Key: activate-plan-42
-X-Genvagent-Writer-Id: plugin-process-9
+Idempotency-Key: input-client-17
+X-Genvagent-Writer-Id: runtime-9
 X-Genvagent-Writer-Epoch: 3
 Content-Type: application/json
 ```
 
 ```json
 {
-  "version": {"contextId": "ctx-a", "versionId": "ver-b"},
-  "expectedHeadRevision": 7,
-  "hostReceipt": {
-    "markerId": "marker-42",
-    "nativePosition": {"entryId": "entry-108"},
-    "appliedBodyHash": "sha256:<64-hex-digits>",
-    "coverage": "working_view"
-  }
+  "afterSequence": 40,
+  "records": [{
+    "eventId": "e-41",
+    "sequence": 41,
+    "originId": "client-input-17",
+    "kind": "message",
+    "actor": {"role": "user", "id": "u-42"},
+    "turnId": "turn-8",
+    "occurredAt": "2026-11-17T10:00:00Z",
+    "payload": {
+      "type": "inline",
+      "value": {
+        "messageId": "msg-17",
+        "speaker": "user",
+        "content": {"type": "inline", "value": "继续修改 Genvagent 文档，沿用 analytics 的组织方式"},
+        "completeness": "complete"
+      }
+    },
+    "sourceRefs": []
+  }]
 }
 ```
 
-成功响应：
+响应为 `{"acceptedThrough":41,"userRevision":208}`。若先前 context 覆盖至 40，Core 现在追加 e-41，并检索用户域内两个项目的 notes。后续候选 ContextVersion.coveredEventSequence 为 41，recalledAtUserRevision 至少为 208；实际调用的 ContextRef 另记在 step_state。
 
-```json
-{
-  "contextId": "ctx-a",
-  "revision": 8,
-  "activeVersion": {"contextId": "ctx-a", "versionId": "ver-b"}
-}
-```
+## 7. 一致性、故障恢复与执行边界
 
-响应丢失后重复同一请求仍返回 revision 8，不产生 revision 9。若从未成功且 head 已被其他请求推进，则返回 VERSION_CONFLICT，附当前 revision。
+### 7.1 提交规则
 
-## 10. 幂等、并发与错误
+- userRevision 对会话注册、原始事件、已发布 notes、反馈及来源失效递增，用于资料与目录的可见性判断；context 使用独立的 head revision，未发布提案和 job 内部状态不推进 userRevision。
+- 原始事件、stream 进度、userRevision 和幂等结果在一个事务提交；引用 blob 必须事先持久化。
+- context 候选不可变，激活使用 expectedHeadRevision 与 writer epoch。跨 Runtime 和 Memory 的应用是可恢复的分步协议。
+- 幂等 key 在有效调用身份、userId、方法和规范化路径内唯一；同 key 不同正文报冲突。重试先重新鉴权，再读取已提交结果。
+- JSON 使用 RFC 8785 JCS 规范化后计算 SHA-256。context 的 bodyHash 对解引用后的正文计算；BlobRef.sha256 对原始字节计算。[JCS 规范](https://www.rfc-editor.org/rfc/rfc8785)
+- 序号、revision、epoch 和大小是非负安全整数。拒绝重复 JSON 属性、非有限数值和不能可靠表示的计数。
+- 只有收到完成结果才能确认工具成功；context 已激活或模型已决定调用工具都不能证明外部动作已完成。
 
-### 10.1 全局规则
+### 7.2 恢复步骤
 
-- Idempotency-Key 在 `(调用身份, scope, HTTP method, 规范化资源路径)` 内唯一；同 key 不同 payload 返回 IDEMPOTENCY_CONFLICT。
-- 处理成功和幂等结果在同一事务中保存。重试先验证当前访问权限，再查幂等结果；存在结果时直接返回，无须重新通过写入版本检查，避免把已成功请求误报为过期写入。
-- 事件 ID、nativeEventId、context version ID 的唯一性与资源寿命一致；即使过期幂等响应被清理，也不能静默重复追加。
-- 客户端串行同步同一 stream。多个 context 可并行，但不能跨 binding 共享 writer lease。
-- 查询带 deadline。客户端对超时、限流与短暂不可用使用退避重试，取消只停止等待，不代表服务端已撤销提交。
-- JSON 请求摘要使用 RFC 8785 JCS 的 UTF-8 输出计算 SHA-256。Context body 在 v1 中为 JSON，bodyHash 对解引用后的 JSON 正文计算，不包含 Content 的 inline/blob 包装，因此改变存储方式不改变正文摘要。BlobRef.sha256 始终对原始 blob 字节计算。摘要字符串使用 `sha256:` 加 64 位小写十六进制。[JCS 规范](https://www.rfc-editor.org/rfc/rfc8785)
-- 协议中的序号、revision、epoch 和大小计数均为非负安全整数；拒绝重复 JSON 属性、非有限数值和不能可靠表示的计数，跨语言实现使用相同序列化测试向量。
+1. 使用认证 userId 和持久 SessionKey，通过本地映射或 resolveSession 找到原 binding。project 切换不影响定位。
+2. getSession 读取进度、head 和应用 receipt，取得新 lease。
+3. 核对本地应用 marker；已应用但激活结果未知时，用原幂等 key 核对或补交，不能直接开始新 step。
+4. 按原事件 ID、序号和批次 key 补传尚未确认的数据；补传不会重新执行工具。
+5. getContext 读取当前版本，再 readEvents 读取 coveredEventSequence 之后的增量；没有版本时从空视图处理全部已提交事件。
+6. 从已提交控制事件重建 turn、排队输入、pending action 与 task 状态；该重建不以 context 的 coveredEventSequence 截断控制历史。已分派任务按 taskId 查找原 Worker，未确认结果先核对，不能重新创建一份任务。
+7. Core 校验工具配对、最新输入、取消状态与执行环境后，从 advance 恢复。
 
-| HTTP / code | 客户端处理 |
+例如 Memory 已接收至 104，context v8 覆盖至 102，Core 重新投影 103、104 并保存新版本。如果服务已确认事件而本地 appendMessages 尚未执行，增量重放可以补齐；如果本地已执行，则按事件 ID 去重。
+
+Host 进程重启、插件 reload 会丢失运行内存；原会话存档、安装标识和同步日志提供恢复身份。Memory API 节点重启依赖共享持久存储。文件、操作系统进程及工具外部副作用仍由运行时核对，Memory 不承诺恢复已丢失的执行环境。
+
+### 7.3 不可用与错误
+
+strict 模式在输入或 context 未确认时停止新的受管理 step。buffered 模式允许从本地持久状态继续，并显示未同步；恢复时取得 lease、核对进度，发生分叉则建立新分支，不能覆盖远端历史。buffered 不保证机器损坏后未同步数据仍可恢复。
+
+| HTTP / code | 处理方式 |
 | --- | --- |
-| 400 / INVALID_ARGUMENT | 修正请求，不自动重复 |
-| 401、403 / UNAUTHORIZED、FORBIDDEN | 更新认证或报告访问失败 |
-| 404 / NOT_FOUND | 明确报告缺失；不以空记忆伪装成功 |
-| 409 / VERSION_CONFLICT | 重读 head，重建候选；不盲目覆盖 |
-| 409 / LEASE_LOST | 停止受管理写入，恢复所有权后核对状态 |
-| 409 / SEQUENCE_GAP、IDEMPOTENCY_CONFLICT | 核对本地同步日志与服务端 receipt |
-| 410 / CURSOR_EXPIRED、SOURCE_DELETED | 全量同步当前视图或停止使用被删除证据 |
-| 412 / NOT_READY | 等待数据可见或补传缺失事件 |
-| 413 / PAYLOAD_TOO_LARGE | 使用 blob 或缩小批次 |
-| 429、503 / RATE_LIMITED、UNAVAILABLE | 遵循 Retry-After 和总 deadline |
+| 400 / INVALID_ARGUMENT | 修正输入 |
+| 401、403 / UNAUTHORIZED、FORBIDDEN | 校验身份与授权，不扩大读取范围 |
+| 404 / NOT_FOUND | 区分新会话与缺失对象，不将缺失伪装为空记忆 |
+| 409 / VERSION_CONFLICT、SEQUENCE_GAP | 读取权威版本或进度后重建 |
+| 409 / LEASE_LOST | 停止远端写入，strict 同时停止新 step |
+| 409 / IDEMPOTENCY_CONFLICT | 核对稳定事件与批次映射 |
+| 410 / SOURCE_DELETED、CURSOR_EXPIRED | 停用已删除来源，或重读当前目录与变更状态 |
+| 412 / NOT_READY | 等待索引可见或补传缺失输入 |
+| 413 / PAYLOAD_TOO_LARGE | 上传 blob 或拆小批次 |
+| 429、503 / RATE_LIMITED、UNAVAILABLE | 按 Retry-After 与总 deadline 重试 |
 
-错误体统一包含 code、message、retryable、requestId；版本冲突附 currentRevision，序号冲突附 acceptedThrough。错误不能包含调用者无权读取的资源正文。
+错误体包含 code、message、retryable、requestId；冲突附当前版本或接收位置。取消等待不代表服务端撤销提交。
 
-### 10.2 断点恢复
+删除、授权撤回和来源失效在精确读取、检索及历史快照读取时同样检查。changes 至少一次投递，客户端按 change ID 去重。compaction 不执行物理删除。
 
-| 中断位置 | 恢复规则 |
-| --- | --- |
-| 事件发送成功但未收到响应 | 原 key 重试，或读取 acceptedThrough 后补传 |
-| 仅保存了候选上下文 | head 保持不变；候选可丢弃或重新验证 |
-| Host 已应用，activate 尚未确认 | 读取持久 marker 与远端 head，用原请求补交；期间不开始新的受管理模型调用 |
-| activate 成功但插件崩溃 | 对比 Host marker、远端版本和原生消息位置，恢复后吸收未处理输入 |
-| 应用期间发生版本冲突 | 停止放行，读取新 head 并从原始记录重新构建；不能把旧候选标为有效 |
-| Memory API 节点重启 | 任意健康节点根据共享存储返回相同版本与幂等结果 |
-| 工具可能执行但没有回执 | 交给 Host 核对外部状态；同步重试绝不重放工具 |
+## 8. 联合验收
 
-## 11. 不可用策略与删除
-
-默认 `strict` 模式：涉及共享上下文的写入或激活未确认时暂停新的受管理步骤。Host 已执行的结果先写原生日志或插件 spool，Memory 恢复后补传。即使 shutdown hook 没有机会执行，也能从持久数据补传。
-
-可配置 `buffered` 模式：Host 依赖本地持久上下文继续工作，并明确显示“尚未同步”；这些本地变更不视为 Memory 已确认版本。恢复连接后先重新获取有效 lease 并核对远端进度，再同步事件和上下文；若远端已被另一 writer 推进，建立新分支进行合并，不能覆盖。此模式不承诺进程所在机器丢失后还能恢复全部未同步内容。
-
-授权撤回和来源删除始终在读取时检查。删除通过 source.deleted 变更传播到记忆、上下文与客户端缓存；旧版本读取也要受限制，不能通过历史快照复活已删除材料。普通 compaction 不执行物理删除。
-
-## 12. 必需的联合契约验证
-
-1. 相同事件批次和 activate 请求重试，不增加事件或 head revision。
-2. 两个 writer 争用同一 binding，只有有效 epoch 能提交。
-3. 模型上下文实际改变，同时 Host 原始记录保持可追溯。
-4. fork 和分支切换后，事件、context head 和 receipt 不串线。
-5. 上传后断线、应用后断线、确认后断线均按同一协议恢复。
-6. 已确认的新事件在指定 minProjectRevision 下可读，索引落后不返回伪成功。
-7. 单机和集群 endpoint 通过相同契约样例；更换 API 节点不改变结果。
-8. 不同 Host 在授权范围内复用 notes；不兼容的 native context 明确拒绝无损恢复声明。
-9. 同项目的不同用户不能检索对方的 private 记录或记忆；同用户跨 Host 可读取已授权的同项目记忆。
-10. 本地映射失效时按 Host 会话身份解析到原 binding，不创建重复记录流；上下文恢复不使用语义搜索。
+1. 同一用户在一个 Router conversation 中讨论两个项目，能检索两边 notes；切换项目不创建新的用户 Memory。
+2. 用户输入、assistant 输出、工具结果各只保存一次；appendEvents 和 appendMessages 中间崩溃仍可恢复。
+3. 一个 turn 内完成 Router → Worker → Router，Worker 消息进入独立 context，结果按原调用关系回到 Router。
+4. Core-owned 与 Host-driven 两种驱动通过同一 step 状态转换与消息序列验证；不出现两个 loop 同时发起模型调用。
+5. 最终答复与 turn 终态持久化后才能标记本轮完成；模型请求可追溯到当时使用的 ContextRef。
+6. Worker 无法借项目过滤或来源引用取得未授予的用户资料；不同用户的同名项目保持隔离。
+7. 旧 writer、并发 context 激活、重复任务投递均符合租约、版本及幂等规则。
+8. 单机与集群使用相同协议；Memory Agent 可在所有 Host 离线时整理用户级与项目级 notes。

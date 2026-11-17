@@ -1,123 +1,137 @@
-# Genvagent 两个系统的架构与边界
+# Genvagent：用户统一 Memory 与 Router/Worker Harness
 
-状态：设计草案 v0.4；2026-11-17。当前仓库仅包含设计文档。
+状态：设计草案 v0.5；2026-11-17。当前仓库仅包含设计文档。
 
-Genvagent 分为 **Agent Harness** 和 **Memory System** 两个可独立实现的系统。Genvagent Harness 以插件接入 dsh、pi 等 agent 应用；Memory System 是独立服务，使用相同协议支持单机和集群部署。两者只通过版本化接口协作。
+Genvagent 包含两个系统：**Agent Harness** 负责用户对话、Router/Worker 执行与工作上下文；**Memory System** 按 user 聚合全部持久信息，独立部署于单机或集群。project notes 属于用户 Memory 内的专题资料。
 
-## 1. 设计文档
+## 1. 使用模型
 
-| 文档 | 主要内容 |
+用户只与 Router 对话。Router 可以读取该用户的长期目标、偏好、历史会话和所有项目 notes，根据当前对话决定直接答复或分派 Worker。Worker 执行具体任务，结果回到 Router，由 Router 对用户负责。
+
+Router 的完整访问能力通过用户概览、跨项目检索与精确来源读取实现；每次模型调用仍只装入当前任务需要的材料。Worker 获得目标、约束、相关证据与项目资料，并维护独立 context。
+
+| 概念 | 归属与关系 |
 | --- | --- |
-| [交互模型与对接协议](integration-protocol.md) | 角色与数据模型、用户数据组织、同步与检索、执行与恢复、协议类型与接口 |
-| [Agent Harness](agent-harness.md) | 插件核心、Host 适配、本地同步状态、Router 与上下文管理 |
-| [Memory System](memory-system.md) | 持久化、用户数据隔离、记忆检索、dreaming，以及单机和集群部署 |
+| User Memory | userId 对应的统一记忆域；不随项目、Host 或进程切换而改变 |
+| User notes | 用户级偏好、目标和通用知识 |
+| Project notes | 用户域内带 projectId 的知识；保留项目适用条件 |
+| Router conversation | 用户持续对话，可在多个项目间切换 |
+| Turn | 从一个用户输入到答复、澄清、失败或取消；可以包含多个 agent step |
+| Worker task | Router 分派的具体工作，使用独立 session、记录流与 context |
 
-建议先阅读交互模型中的概念与流程，再分别审阅两个系统及接口细节。协议是两侧的共同契约。
+第一版不引入跨用户团队知识库。同名项目在不同用户下分别保存；同用户跨项目引用是正常能力。
 
-## 2. Host 与 Genvagent Harness 的关系
-
-**Host** 指加载 Genvagent 插件的完整 agent 应用，例如 dsh、pi。它提供模型调用循环、工具执行、权限控制、会话管理和界面。dsh、pi 本身也属于广义的 agent harness；本项目使用 Host 表示它们相对于插件的角色。
-
-**Genvagent Harness** 专指本项目的插件层，由 Harness Core、Host Adapter 和 Memory Client 组成。Host Adapter 使用各应用的扩展点，Core 提供 Router 与上下文管理，Memory Client 负责调用独立服务。因此 Host 与 Genvagent Harness 是应用与插件的关系，两个设计系统仍然是 Genvagent Harness 和 Memory System。
-
-下图表示一个 Host 实例内的插件及其服务连接；每个 dsh、pi 实例分别加载对应的 Adapter。
+## 2. 两大系统的关系
 
 ```mermaid
-flowchart LR
-    subgraph HostApp["Host：dsh、pi 等 agent 应用"]
-        E[模型循环 / 工具执行 / 会话管理]
-        subgraph Plugin["Genvagent Harness 插件"]
-            D[Host Adapter]
-            H[Harness Core]
-            C[Memory Client]
-            D <--> H
-            H --> C
+flowchart TB
+    U[User] --> R
+    subgraph H["Genvagent Agent Harness"]
+        subgraph C["Harness Core"]
+            R[Router / Turn Controller]
+            L[Agent Controller / logical loop]
+            T[Task Controller / Worker sessions]
+            X[Context Controller]
+            S[Memory Coordinator]
+            R --> L
+            L <--> T
+            L <--> X
+            X --> S
+            T --> S
         end
-        E <--> D
+        D[Runtime Driver / Host Adapter]
+        L <--> D
     end
-    subgraph Memory["独立部署的 Memory System"]
-        A[Memory API]
-        S[(原始记录 / 上下文版本)]
-        R[Memory Retrieval]
-        M[Memory Agent]
-        N[(长期记忆 / 预备 notes)]
-        A --> S
-        A --> R
-        S --> M
-        M --> N
-        N --> R
-        S --> R
+    D <--> HOST[模型与工具运行环境：独立 Driver / dsh / pi]
+    S --> API
+    subgraph M["独立 Memory System"]
+        API[Memory API]
+        DATA[(用户事件 / context / notes)]
+        FIND[Overview / Retrieval]
+        DREAM[Memory Agent / Validator]
+        API --> DATA
+        API --> FIND
+        DATA --> DREAM
+        DREAM --> DATA
+        FIND --> DATA
     end
-    C -->|HTTP JSON v1| A
 ```
 
-Memory System 不依赖某个 Host 的运行进程。Memory Agent 可以在所有 Host 离线时执行整理，活动会话的下一次模型输入仍由 Harness 与 Host 决定。
+**Host** 指 dsh、pi 这样的完整 agent 应用。Genvagent 以 Adapter 接入其扩展点；Host 提供底层模型调用、工具执行、界面、权限与工作环境。
 
-## 3. 状态归属与持久化
+**Harness Core 拥有逻辑 agent loop。** 它接收输入、提交上下文、决定下一动作、处理工具与任务结果、结束 turn。模型 SDK 和工具进程属于 Runtime Driver；这种划分使同一 Core 可以独立运行，也可以由 Host 回调驱动。
 
-Host 管理的状态分为会话存档、执行记录、运行环境和配置；它们具有不同的持久化方式与恢复能力。
+## 3. Core 与 loop 的边界
 
-| 数据或状态 | 更新责任 | 持久化位置与恢复依据 |
+Core 内包含 Turn Controller、Agent Controller、Router Policy、Task Controller、Context Controller 和 Memory Coordinator。Router 与 Worker 共用 step 状态机，分别持有自己的执行状态和上下文。
+
+| 驱动方式 | Core 的职责 | Runtime 的职责 |
 | --- | --- | --- |
-| Host 会话存档 | Host | Host 自己管理的 session 文件或数据库，包含消息、分支关系、会话设置等；格式取决于 Host |
-| 任务与工具执行记录 | Host | Host 提供的任务日志、工具回执等；只有 Host 实际持久化的执行状态才能用于恢复 |
-| 文件、worktree、运行进程 | Host 及其执行环境 | 文件与 worktree 位于工作区；活跃进程属于操作系统运行状态，保存上下文不等于保存进程 |
-| 模型配置、工具定义、授权与凭据 | Host | Host 配置或凭据存储；恢复时重新加载，凭据不进入 Memory |
-| Host 身份映射、事件编号、未确认批次 | Harness Core / Adapter | 插件本地持久状态目录与同步日志，用于定位 binding、幂等重传和断点核对 |
-| 原始消息、模型输出、工具结果 | Host 产生，Harness 规范化与同步 | Memory 的 records 与 blobs；Host 存档同时作为同步和核对来源 |
-| 工作上下文及其当前版本 | Harness 构建，Memory 提交版本 | Memory 的 context_versions、context_heads；保留来源与已纳入的事件序号 |
-| 上下文应用标记与确认 | Host Adapter | Host 持久 marker 和 Memory receipt，分别记录本地应用及服务端确认 |
-| 长期知识、偏好、冲突与预备 notes | Memory Agent | Memory 的 memory_revisions、来源引用与失效记录 |
+| Core-owned | Runner 调用 advance，驱动完整逻辑循环 | 按动作调用模型/工具并回传结果 |
+| Host-driven | Adapter 在 Host 安全边界调用 advance，Core 决定允许的下一步 | Host 原生 loop 执行该步骤并发出完成事件 |
 
-Host 存档的具体路径由 Host 配置决定，Genvagent 通过 Adapter 读取，不假设所有 Host 具有相同文件格式。插件本地目录保存传输与恢复所需的状态；已确认的原始记录、长期记忆及显式工作上下文以 Memory 中的持久化对象为准。
+一个 session 只使用一种驱动方式。Host-driven 的底层调用栈可以仍由 Host 持有，但不能由 Host 和 Core Runner 同时发起下一模型调用。无法接入请求 gate、上下文应用和结果关联的 Adapter 仅提供 Sync/Recall，不宣称实现完整编排。
 
-**上下文存储与编辑决策分离。** Harness 选择、压缩或编辑工作上下文；Memory 保存不可变版本。Memory Agent 整理长期记忆，发布修订供后续请求读取。
+这一区分既明确 Core 的执行责任，也保留集成 dsh、pi 的插件路径。详细函数与状态机见[Harness Core](agent-harness.md)。
 
-用户数据按 workspace/project 和 ownerUserId 归属。一个用户可在多个 Host 上建立独立 binding、记录流和上下文；同用户可复用其项目内的私有记忆，项目成员可读取已授权共享的记忆。相同项目不自动共享私有会话。[完整数据组织](integration-protocol.md#3-用户数据组织与存储)
+## 4. 每轮对话的数据流
 
-模型内部隐状态、供应商 KV cache、凭据及活跃操作系统进程不属于可移植上下文。跨 Host 复用长期记忆不要求恢复原执行环境；恢复整个执行会话还取决于消息格式、工具状态和 Adapter 能力。
+```text
+用户输入
+  → Core 创建 turn，追加原始事件到 Memory
+  → 将已提交 Message 追加到 Router 工作 context
+  → 检索用户 Memory，保存并应用 context 版本
+  → Router 模型 step
+      → 直接答复
+      → 或创建 Worker task，执行多个 Worker step，再回传结果
+  → 追加 Router 的最终消息
+  → 保存最终 context checkpoint
+  → 追加引用 checkpoint 的 turn 终态
+  → 对用户标记本轮完成
+```
 
-## 4. 第一版范围
+事件追加与 context 更新是两个操作。事件流保存原始来源；context 是 Core 构建的输入工作视图，允许选择和压缩。每条完成消息及时保存，在下一模型请求前和 turn 结束前提交 context checkpoint。
 
-第一版实现两个完整流程：
+Memory Agent 独立整理 user/project notes，发布修订；Harness 在后续请求边界读取。后台整理不直接改写活动 context。
 
-1. **Harness**：Host 记录同步 → 检索 → 构建或编辑上下文 → Host 应用 → 确认版本 → 同步执行结果。
-2. **Memory**：保存证据 → 检索 → 后台校对 → 发布记忆修订 → 通知更新与失效。
+## 5. 状态责任与持久化
 
-Router 保留为可替换策略，先负责上下文需求和已有会话的路由；创建子 agent 仅在 Host 提供能力时启用。未来 query notes 先覆盖高频问题与未完成任务。
+| 状态 | 更新责任 | 持久化与恢复依据 |
+| --- | --- | --- |
+| turn、step、task、动作与结果 | Harness Core | Memory 事件流为恢复依据，本地索引用于加速 |
+| 原始消息与工具交换 | Core 规范化，Runtime 提供结果 | Memory records/blobs；Host 原生存档用于同步核对 |
+| 工作 context 及其已处理位置 | Context Controller | Memory 不可变版本与 ContextHead |
+| context 是否已应用 | Runtime Driver / Host Adapter | 本地持久 marker 与 Memory application receipt |
+| 用户与项目 notes | Memory Agent / Validator | NoteRevision、来源、适用条件与失效状态 |
+| 安装身份、会话映射、待发送批次 | Memory Coordinator | 插件/Runner 的本地 stateDir |
+| 文件、worktree、工具运行进程 | Runtime / Host | 实际工作区、执行日志和工具回执 |
+| 模型配置、工具定义、权限及凭据 | Runtime / Host | 运行环境配置与凭据存储；凭据不进入 Memory |
 
-本轮范围不包含新的通用任务调度器、跨 Host 工具执行器、全球一致快照、专用训练流水线或完整知识图谱。单机与集群部署共用 Memory API、数据库约束和数据模型；扩容通过 API 副本和后台 worker 完成。
+恢复 agent 的逻辑进度与恢复外部工具状态分别处理。上下文持久化不能证明工具已执行成功，恢复记录也不能触发重复外部操作。Host 存档路径与格式由 Adapter 解释，不假设所有 Host 具有相同实现。
 
-## 5. 独立交付与联合验收
+## 6. 文档顺序与交付
 
-| 交付 | 可独立验证的结果 |
-| --- | --- |
-| 协议与契约样例 | 用户数据隔离、重试不重复写、旧 writer 被拒绝、候选与已激活版本明确区分 |
-| Harness Core + 模拟 Memory | 插件加载、事件映射、上下文修改、卸载与会话恢复 |
-| Memory Service + 测试客户端 | 持久记录、检索、版本管理、独立 dreaming |
-| dsh 与 pi 适配 | 原始记录不丢失、实际模型输入按能力声明变化、分支不混淆 |
-| 单机与集群 Memory | 客户端仅改变 endpoint；节点重启不丢已确认写入，不重复发布记忆 |
+1. [交互逻辑、接口函数与数据结构](integration-protocol.md)：先阅读每轮执行，再查看两侧调用与存储对象。
+2. [Agent Harness](agent-harness.md)：Core 模块、loop、Runtime 端口及 dsh/pi 适配。
+3. [Memory System](memory-system.md)：用户域、内部服务函数、notes 与独立部署。
 
-共享类型与 Memory Client 可以复用；Harness 不导入 Memory 内部表结构，Memory 不导入 dsh 或 pi SDK。
+第一版以 Core 状态机和参考 Driver 验证 Router → Worker → Router 的完整流程，再将同一契约映射到 dsh/pi。Memory 首先实现事件、context 和关键词检索，随后加入有预算的后台整理与预备 notes。
 
-## 6. 计划中的仓库结构
+不引入新的通用分布式任务平台、跨地域强一致服务或完整知识图谱。单机与集群共用 Memory 协议；Harness 不导入 Memory 内部数据库结构，Memory 不导入 Host SDK。
+
+计划仓库结构：
 
 ```text
 Genvagent/
   docs/
-    architecture.md
-    integration-protocol.md
-    agent-harness.md
-    memory-system.md
-  packages/                       # 实现阶段创建
-    protocol/                     # 协议 schema 与兼容性样例
-    memory-client/                # 远程调用、幂等与重试
-    harness-core/                 # Host 无关能力与扩展点
-    adapter-dsh/
+  packages/
+    protocol/                    # 公共函数契约与类型
+    memory-client/               # 用户域客户端、幂等与重试
+    harness-core/                # turn / step / task / context 逻辑
+    runtime-driver/              # Core-owned 参考 Driver
+    adapter-dsh/                 # Host-driven 接入
     adapter-pi/
   services/
-    memory/                       # API、存储、检索、后台 worker
-  evals/                          # 两侧独立评估及联合契约验证
+    memory/                      # API、存储、检索、后台 Worker
+  evals/                         # 两侧独立与联合契约验证
 ```
-
-数据结构示例沿用 TypeScript 风格记法；它不限制 Memory Service 的实现语言。具体 Host API 的核对依据及适配限制记录在 Harness 文档中。

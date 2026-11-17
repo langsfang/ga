@@ -1,166 +1,267 @@
-# Agent Harness 插件设计
+# Agent Harness：Core、执行循环与插件接入
 
-状态：设计草案 v0.4；2026-11-17。公共数据与网络接口见[对接协议](integration-protocol.md)。
+状态：设计草案 v0.5；2026-11-17。按执行概念、接口函数、关键结构说明设计。共享协议见[交互逻辑与接口](integration-protocol.md)。
 
-## 1. 定位与边界
+## 1. Harness Core 的组成
 
-Host 是加载插件的完整 agent 应用，例如 dsh、pi；它们本身也属于广义的 agent harness。本文的 **Genvagent Harness** 专指加载其中的插件层：**Harness Core + Host Adapter + Memory Client**，Core 内的 Router 和 Context Policy 可替换。dsh、pi 分别通过原生插件或 extension 加载对应 Adapter，共用 Core 和协议。
+Harness Core 是 Router 和 Worker 的执行控制核心，拥有逻辑 agent loop。它管理从输入到完成的状态转换，决定何时检索、何时调用模型、何时执行工具、何时派发任务及何时结束本轮。
 
-Host 保留模型执行循环、原生 session、工具执行、授权、取消和界面。Genvagent 不再为这些能力建立第二套通用任务状态机；Core 负责记忆同步、上下文管理、Router 策略和对接协议。
+| Core 内部模块 | 职责与输入输出 |
+| --- | --- |
+| Conversation / Turn Controller | 接收用户输入，创建 turn，管理排队、纠正、取消与最终答复 |
+| Agent Controller | 对 Router/Worker 运行同一 step 状态机；根据上下文和上一步结果产生下一动作 |
+| Router Policy | 使用用户统一 Memory，决定直接回答、检索、委派或继续任务；可以由模型实现 |
+| Task Controller | 保存任务分派，创建 Worker session，追踪结果与回传，按任务标识去重 |
+| Context Controller | 追加消息、选择 notes、管理工具交换、压缩与 CLM 编辑、建立版本 checkpoint |
+| Memory Coordinator | 事件规范化、持久发送日志、Memory 调用、版本提交、恢复与变更处理 |
 
-原始记录、长期记忆和工作上下文版本存储在 Memory Service，Core 维护当前工作视图与同步状态。原生会话记录和本地同步 spool 用于可靠投递及故障核对，其存在不把长期记忆绑定到某个进程。
+Runtime Driver 与 Memory Client 是 Core 的端口实现。Host Adapter 是针对 dsh、pi 的 Runtime Driver：将 Host 扩展点映射为 Core 的动作与完成事件。UI、模型 SDK、工具进程、文件系统和凭据存储属于运行环境。
 
-## 2. 模块与关键对象
+```mermaid
+flowchart TB
+    U[User / UI] --> T
+    subgraph Core["Harness Core"]
+        T[Turn Controller] --> A[Agent Controller / logical loop]
+        A --> R[Router Policy]
+        A --> K[Task Controller]
+        K --> A
+        A <--> C[Context Controller]
+        C --> M[Memory Coordinator]
+        T --> M
+        K --> M
+    end
+    A <--> D[Runtime Driver / Host Adapter]
+    D <--> E[模型调用 / 工具 / Host]
+    M --> MC[Memory Client]
+    MC --> MS[User Memory Service]
+```
 
-| 模块 | 职责 | 关键结构 |
+Router 与 Worker 是角色，Agent Controller 是执行机制。Memory Agent 属于另一个系统，不作为 Harness 的 Worker 调度。
+
+## 2. loop 的归属与执行模式
+
+### 2.1 Core 管理的逻辑循环
+
+一个 turn 可以包含多个 agent step，Worker 也可以在同一 turn 内完成多个模型与工具交换。Core 的循环为：
+
+```text
+接收并持久化输入
+  → 追加工作上下文
+  → 检索与组装候选
+  → 保存、应用、确认 context
+  → 请求一次模型调用
+  → 持久化模型输出并追加 context
+  → 解释决策
+      ├─ 工具调用 → 执行并持久化结果 → 追加 context → 下一 step
+      ├─ Worker 任务 → 等待或处理其他已分派任务 → 追加结果 → 下一 step
+      ├─ 需要更多记忆 → 检索并更新 context → 下一 step
+      └─ 答复 / 澄清 / 失败 / 取消 → checkpoint → 保存终态 → 结束 turn
+```
+
+advance 每次只决定下一动作。若存在未确认动作，它返回同一待处理动作或等待状态；不会因为再次调用 advance 就再次发起模型或工具请求。动作 ID、执行状态和结果关联均写入 Memory 事件流。
+
+Context Controller 只接收已提交且已被当前执行选用的事件进行消息投影。排队输入在 startTurn 时才按原事件引用追加；迟到任务结果也必须由 Router 明确接纳。当前用户目标、约束和工具协议保持受保护；被移出视图的历史仍有原始证据。状态事件推进消费序号，但不直接成为模型消息。
+
+### 2.2 逻辑 loop 与运行时驱动
+
+Core 管理执行语义，Runtime Driver 执行具体动作。插件化要求允许已有 Host 驱动回调，但不意味着把 Router、任务和上下文控制留在 Core 外。
+
+| 模式 | 谁推进 Core | 谁实际发起模型/工具调用 | 适用方式 |
+| --- | --- | --- | --- |
+| Core-owned | Core Runner 持续调用 advance，等待完成事件后继续 | 独立 Runtime Driver 按 Core 动作调用 SDK/工具 | 独立运行、模拟测试、完整参考实现 |
+| Host-driven | Host Adapter 在安全边界调用 advance，将 Host 完成事件交回 Core | Host 原生 loop 只执行 Core 允许的下一动作 | dsh/pi 插件接入 |
+
+在 Host-driven 模式下，Core.advance 仍决定调用前的上下文与逻辑状态；Driver.execute(invoke_model) 表示放行匹配 actionId 的 Host 请求，不再启动另一个模型调用。每个 session 在配置时只选择一种驱动模式。
+
+Host 的调用栈可能包含自己的循环，但不能与 Core Runner 同时推进同一 session。如果 Host 无法阻止后续请求、无法应用上下文或无法持久化关联标记，则该 Adapter 只能提供同步/检索能力，不能声称实现完整受控 loop。
+
+### 2.3 turn、step 与任务状态
+
+| 状态 | 进入条件 | 后续动作 |
 | --- | --- | --- |
-| Host Adapter | 生命周期、事件、上下文和原生工具接入 | AdapterCapabilities、HostFrame、HostApplicationReceipt |
-| Harness Core | 组织同步与请求边界，管理一次上下文变更 | SessionBinding、SyncState、ContextPlan |
-| Router Strategy | 根据目标决定上下文需求和会话分派 | RoutePlan |
-| Context Controller | 构建工作视图，接受模型编辑并校验 | WorkingContext、WorkingBlock、ContextPatch |
-| Memory Client | 协议调用、认证、幂等、重试与变更拉取 | 协议请求/响应 |
+| turn queued | 新输入已持久化，上一 turn 尚未结束 | 等待或按显式纠正/取消处理 |
+| turn running | 当前 turn 已开始 | 推进 Router step |
+| step preparing | 已取得新输入或工具/任务结果 | 检索并提交 context |
+| step model_pending | 模型动作已登记并放行 | 等待完成或核对未知结果 |
+| step action_pending | 模型已返回工具/委派决策 | 执行工具、派发 Worker 或等待 |
+| turn completed / awaiting_user | 答复或澄清已持久化并 checkpoint | 向用户呈现完成状态 |
+| turn failed / canceled | 失败或取消已记录并 checkpoint | 不再安排新动作，保留诊断及迟到结果 |
 
-Router Strategy 和 Context Policy 可替换。适配器只翻译 Host 能力，不复制事实提取、检索排序和 dreaming 逻辑。
+工具调用或 Worker 任务可能在取消后才完成。Core 保存结果用于核对，并按原 turn/task 关联隔离；除非 Router 显式选择继续使用，否则不进入新 turn 的输入。
 
-## 3. Host 适配契约
+## 3. 接口函数
 
-类型 ID、JsonValue、Content、RecordInput、ContextRef、ContextHead、SessionBinding、WriterLease、HostApplicationReceipt、RecallRequest 和 Timestamp 均来自对接协议。
+### 3.1 应用与 Runtime 回调到 Core
 
 ```typescript
-interface AdapterCapabilities {
-  durableEventExport: boolean;
-  durableMarkers: boolean;
-  safeRequestGate: boolean;
-  contextRewrite: "none" | "regions" | "full_working_view";
-  requestCapture: "working_view" | "model_messages" | "provider_payload";
-  branchLifecycle: boolean;
-  nativeResume: boolean;
-  spawnChildren: boolean;
-}
-
-type HostEvent = Omit<RecordInput, "eventId" | "sequence">;
-
-interface HostFrame {
-  bindingId: ID;
-  nativeRevision: string;         // 当前可见分支、消息范围及相关配置的版本摘要
-  nativePosition: JsonValue;
-  protectedContent: Content;
-  workingContext: WorkingContext;
-  inputTokenBudget: number;
-  pendingToolCallIds: string[];
-}
-
 interface HarnessCorePort {
-  open(binding: SessionBinding, capabilities: AdapterCapabilities): Promise<void>;
-  ingest(events: HostEvent[]): Promise<void>;
-  prepareRequest(frame: HostFrame): Promise<ContextPlan>;
-  confirmApplied(planId: ID, receipt: HostApplicationReceipt): Promise<ContextHead>;
-  close(): Promise<void>;
-}
-
-interface HostAdapter {
-  name: string;
-  capabilities: AdapterCapabilities;
-  attach(core: HarnessCorePort): Promise<() => Promise<void>>;
+  openConversation(registration: SessionRegistration): Promise<BindingState>;
+  submitUserMessage(routerBindingId: ID, inputId: ID, content: Content): Promise<TurnHandle>;
+  cancelTurn(turnId: ID): Promise<void>;
+  advance(bindingId: ID): Promise<AgentAction>;
+  acceptCompletion(actionId: ID, completion: ActionCompletion): Promise<void>;
 }
 ```
 
-以上是 Genvagent 内部拟定接口，不是 dsh 或 pi 的现有 SDK 名称。adapter.attach 注册原生 hooks、工具与必要的命令，并返回卸载函数。
+openConversation 只创建或恢复 Router 关联；Worker 由 Task Controller 注册。submitUserMessage 的 inputId 来自 UI/Host 的稳定消息标识，返回已持久化的 turn handle，不等待整轮模型与任务完成。
 
-一次请求分两次回调完成：prepareRequest 只返回候选；adapter 在原生 hook 中应用后，于允许模型请求前调用 confirmApplied。禁止在早期 hook 中等待一个必须等该 hook 返回后才发生的回调，避免生命周期死锁。
+acceptCompletion 将已完成输出归一化为事件，先通过 Memory 确认，再调用 Context Controller 更新工作副本。Host 的最终消息与 tool-result 生命周期通知按原生身份归并，不能将同一工具结果保存两次。早期可变 hook 的参数和流式 token 不作为最终消息。
 
-Core 对版本冲突返回明确错误，由 adapter 阻止放行并重新读取 HostFrame。nativeRevision 在候选准备后改变，尤其是用户插入消息、取消或切换分支时，原候选作废。
-
-### 3.1 能力等级
-
-| 等级 | 要求与行为 |
-| --- | --- |
-| Recall | 同步记录、读取相关记忆并注入 Host；不宣称具备完整 CLM |
-| Context rewrite | Host 允许改变下一轮工作消息；模型编辑经过保护和工具配对校验 |
-| Strict recoverable | 在上述基础上有持久 marker、安全请求 gate 和可重放事件，遵守准备/激活协议 |
-
-能力不足时配置检查失败或显式选择较低模式。不能以“记录到本地文件”代替实际改写下一轮输入，也不能以自定义 UI 展示证明已影响模型。
-
-## 4. Core 同步状态与上下文计划
+### 3.2 Core 调用运行时
 
 ```typescript
-interface SyncState {
-  binding: SessionBinding;
-  nativeSessionLocator: string;   // Adapter 可解析的 Host 会话存档位置
-  writer?: WriterLease;           // 启动后重新获取，不以本地旧值证明有效
-  lastExportedNativePosition: JsonValue;
-  acceptedThrough: number;
-  nextSequence: number;
-  activeContext?: ContextRef;
-  headRevision: number;
-  pendingPlanId?: ID;
-  lastApplicationMarkerId?: string;
-  changesCursor?: string;
+interface RuntimeDriver {
+  capabilities: AdapterCapabilities;
+  applyContext(plan: ContextPlan): Promise<HostApplicationReceipt>;
+  ensureWorker(task: TaskSpec): Promise<SessionRegistration>;
+  execute(action: AgentAction & { kind: "invoke_model" | "execute_tool" }): Promise<void>;
+  cancel(actionId: ID): Promise<void>;
+  reconcile(actionId: ID): Promise<RuntimeActionState>;
 }
 
+interface HostAdapter {
+  attach(core: HarnessCorePort): Promise<RuntimeDriver>;
+  detach(): Promise<void>;
+}
+```
+
+execute 确认运行时接收动作，不等于动作已经成功；完成结果通过 acceptCompletion 返回。Driver 按 actionId 持久记录接收与执行状态，重复提交返回已有状态，不重复启动动作。reconcile 用于核对崩溃前的动作；无法确定外部执行结果时返回 unknown，Core 不自动重放该动作。这不构成对任意外部工具的 exactly-once 承诺。
+
+dispatch_task 交给 Task Controller：先保存任务，再 ensureWorker，取得稳定 SessionKey 后向 Memory 注册 Worker binding、写入 assignment，并推进 Worker 的 advance。ensureWorker 按 taskId 幂等，只建立执行容器；不能绕过 Core 自行开始模型调用。wait、finish_task 和 finish_turn 由 Core 处理，不传给 Driver.execute。
+
+applyContext 在安全边界修改工作视图并持久化 marker。Core 随后调用 Memory.activateContext，确认后才能 execute 模型动作。Host-driven 模式须安排正确的 hook 顺序，不能在早期 hook 中等待必须等该 hook 返回后才触发的完成回调。
+
+### 3.3 Core 内部协作接口
+
+| 模块 | 函数 | 责任 |
+| --- | --- | --- |
+| Turn Controller | enqueueInput / startTurn / finishTurn | 稳定输入去重、轮次排队、终态与交付 |
+| Agent Controller | advance / recordAction / acceptCompletion | 选择下一动作、保存执行意图、处理完成结果 |
+| Router Policy | decideRoute(context, memory) | 生成答复、检索或 TaskSpec；不直接操作进程 |
+| Task Controller | dispatchTask / acceptTaskResult / resumeTask | 先保存分派，再创建或查找 Worker；结果关联到原调用 |
+| Context Controller | appendMessages / buildContext / editContext | 事件投影、组装候选、校验 CLM 编辑 |
+| Context Controller | checkpoint | putContext → applyContext → activateContext |
+| Memory Coordinator | commitEvents / recoverSession / pollChanges | 持久投递、断点恢复、notes 更新与失效 |
+
+Router Policy 和 Context Policy 可替换，Agent Controller 的持久化和状态转换约束不可由策略绕过。CLM 的 context.inspect、context.edit 是受控工具，编辑发生在可编辑块，仍需 checkpoint 才影响下一次模型输入。
+
+### 3.4 Core 调用 Memory
+
+Core 使用[公共 Memory 函数](integration-protocol.md#42-core--memory-的主接口)。关键关系如下：
+
+- commitEvents 调用 appendEvents，取得 acceptedThrough 与 userRevision。
+- appendMessages 消费已提交事件；不通过 recall 获取本 session 的新增输入。
+- Router 首次准备读取 getUserOverview；后续按 changes 更新目录，并使用 recall 跨项目查询。
+- checkpoint 调用 putContext 与 activateContext；应用动作通过 Runtime Driver 完成。
+- dispatchTask 创建 Worker binding，先保存 assignment，再推进 Worker 的 advance。
+- Worker 通过 proposeNote 提交项目 notes 候选；Memory Agent 在服务端校对发布。
+
+## 4. 关键数据结构
+
+共享的 UserDomain、Message、SessionBinding、RecordInput、WorkingContext、ContextVersion 和引用类型由协议定义。以下只定义 Harness 的执行状态。
+
+### 4.1 turn、step 与动作
+
+```typescript
+interface TurnHandle {
+  turnId: ID;
+  conversationId: ID;
+  routerBindingId: ID;
+  inputEvent: EvidenceRef;
+  status: "queued" | "running" | "completed" | "awaiting_user" | "failed" | "canceled";
+}
+
+interface StepState {
+  stepId: ID;
+  bindingId: ID;
+  turnId: ID;
+  status: "preparing" | "model_pending" | "action_pending" | "completed" | "failed";
+  inputContext?: ContextRef;
+  pendingActionIds: ID[];
+  resultRefs: EvidenceRef[];
+}
+
+type AgentAction = {
+  actionId: ID;
+  bindingId: ID;
+  turnId: ID;
+  stepId?: ID;
+} & (
+  | { kind: "invoke_model"; context: ContextRef }
+  | { kind: "execute_tool"; call: ToolCall }
+  | { kind: "dispatch_task"; task: TaskSpec }
+  | { kind: "wait"; pendingActionIds: ID[] }
+  | { kind: "finish_task"; result: TaskResult }
+  | { kind: "finish_turn"; status: "completed" | "awaiting_user" | "failed" | "canceled";
+      output?: EvidenceRef }
+);
+
+type ActionCompletion =
+  | { kind: "model"; message: Message }
+  | { kind: "tool"; message: Message }
+  | { kind: "task"; result: TaskResult }
+  | { kind: "error"; message: string; outcome: "failed" | "unknown" };
+
+interface RuntimeActionState {
+  actionId: ID;
+  status: "not_started" | "running" | "completed" | "failed" | "unknown";
+  completion?: ActionCompletion;
+}
+```
+
+TurnHandle、StepState 和动作状态可从绑定的事件流重建；内存索引只是加速。已完成的输入、调用意图与结果必须持久化。finish_turn 先确认最终消息所在的 context checkpoint，再追加含该 ContextRef 的终态事件；响应丢失按稳定事件 ID 核对。上下文激活本身不证明 invoke_model 已执行；模型或工具结果未知时使用 reconcile。
+
+### 4.2 Worker 分派与回传
+
+```typescript
+interface TaskSpec {
+  taskId: ID;
+  userId: ID;
+  conversationId: ID;
+  parentTurnId: ID;
+  routerBindingId: ID;
+  dispatchActionId: ID;
+  delegateToolCallId: ID;
+  projectId?: ID;
+  goal: string;
+  constraints: string[];
+  inputRefs: EvidenceRef[];
+  readGrant: ReadGrant;
+  maxSteps: number;
+}
+
+interface TaskResult {
+  taskId: ID;
+  resultId: ID;
+  workerBindingId: ID;
+  status: "completed" | "needs_input" | "failed" | "canceled";
+  output: Content;
+  sourceRefs: EvidenceRef[];
+  noteProposalIds: ID[];
+}
+
+interface TaskState {
+  spec: TaskSpec;
+  status: "created" | "running" | "waiting_input" | "completed" | "failed" | "canceled";
+  workerBindingId?: ID;
+  result?: TaskResult;
+  deliveredToRouterEventId?: ID;
+}
+```
+
+一个任务的 Worker binding 以 taskId 建立稳定映射，重复 dispatch 查找原 Worker。新任务从 TaskSpec 与选定材料构建 context，不复制 Router 的完整历史。TaskSpec.userId 必须匹配创建该任务的用户域；默认 Worker 的 readGrant 为 task 类型。
+
+TaskResult 对 Router 表现为 delegate 的 tool result。Worker 的 finish_task 先确认输出与最终 checkpoint，Task Controller 再经原 dispatchActionId 的 acceptCompletion 将结果写入 Router 流；两个流不使用跨系统事务，通过稳定结果投递 ID 保证可重试。needs_input 交由 Router 向用户提问。
+
+### 4.3 context 与同步检查点
+
+```typescript
 interface ContextPlan {
   planId: ID;
   bindingId: ID;
   baseNativeRevision: string;
-  version: ContextRef;
-  expectedHeadRevision: number;
+  version: ContextVersion;
   desired: WorkingContext;
-  bodyHash: string;
-}
-```
-
-SyncState 是可持久化的同步检查点；本地目录由 HarnessConfig.stateDir 指定。Adapter 也可以在 Host 的持久扩展记录中保存关联标记，但必须能在插件重新加载后定位。
-
-| 本地对象 | 保存内容 | 恢复用途 |
-| --- | --- | --- |
-| 安装身份 | 稳定的 hostInstanceId | 区分 Host 安装实例；进程重启不重新分配 |
-| 会话映射 | scope、ownerUserId、Host session/branch → bindingId | 确定应读取哪条记录流和上下文 |
-| 同步检查点 | SyncState、Host 会话存档定位信息 | 对比本地进度和 Memory 已确认进度 |
-| 待发送日志 | 原始事件 ID 映射、序号、批次正文或持久来源、Idempotency-Key | 原样补传未确认批次 |
-| 待确认上下文计划 | ContextPlan、应用 marker、激活请求正文与 Idempotency-Key | 核对已应用但未确认的版本 |
-
-会话映射的 ownerUserId 来自认证身份。用户切换账号或项目时重新选择映射，不复用其他用户的 binding。安装标识 hostInstanceId 与 WriterLease.ownerId 不同：后者每次插件实例启动重新分配，只用于排除并发写入。
-
-本地映射缺失时，Core 以原 Host 身份调用 bindings:resolve 精确查询服务端。随后读取 binding 状态、取得新 lease，核对应用标记并补传原事件。读取当前上下文后，再取 coveredEventSequence 之后的事件作为增量。[协议恢复步骤](integration-protocol.md#53-确定性恢复步骤)
-
-尚无激活版本的新会话从空工作视图和全部已提交记录开始。nativeSessionLocator 只定位 Host 的会话存档，不代表 Memory 保存了对应工作区文件或运行中的工具。恢复工具执行由 Host 负责。
-
-未收到 receipt 的事件按原标识补传；上下文写入受到 Memory writer lease 与版本检查约束。断电后仍需恢复的映射、日志和计划必须先持久化，再发送对应请求。
-
-事件同步以最终持久化的原生记录为准。早期可变 hook 的参数只用于运行时观察，不能抢先当成最终消息上传；工具生命周期通知与最终 tool-result 消息按同一原生结果身份归并，防止重复记忆。Host 需要显式 flush 才能保证 marker 持久时，adapter 必须等待 flush。
-
-同一 binding 的请求边界串行处理。并发子 agent 使用独立 binding；Core 不接管 Host 本身的调度锁。Memory 不可用时执行 strict 或 buffered 策略，不能无提示地切换保证级别。
-
-## 5. Router 与上下文策略
-
-```typescript
-interface RoutePlan {
-  action: "continue" | "select_session" | "delegate";
-  targetBindingId?: ID;
-  goal: string;
-  informationNeeds: string[];
-  recallRequests: RecallRequest[];
-  contextBudgetTokens: number;
-  reason: string;
-}
-
-interface RouterStrategy {
-  decide(frame: HostFrame, userGoal: string): Promise<RoutePlan>;
-}
-
-interface WorkingContext {
-  format: "genvagent.context.v1";
-  goal: string;
-  blocks: WorkingBlock[];
-}
-
-interface WorkingBlock {
-  id: ID;
-  category: "goal" | "constraint" | "memory" | "evidence"
-    | "progress" | "message" | "tool_exchange";
-  content: Content;
-  sourceRefs: EvidenceRef[];
-  editable: boolean;
 }
 
 interface ContextPatch {
@@ -168,19 +269,56 @@ interface ContextPatch {
   replacementEditableBlocks: WorkingBlock[];
   explanation: string;
 }
+
+interface SyncState {
+  binding: SessionBinding;
+  writer?: WriterLease;
+  acceptedThrough: number;
+  projectedThrough: number;       // 当前工作副本已消费的位置，可高于已保存快照
+  nextSequence: number;
+  activeContext?: ContextRef;
+  headRevision: number;
+  pendingPlanId?: ID;
+  pendingActionIds: ID[];
+  lastApplicationMarkerId?: ID;
+  changesCursor?: string;
+}
+
+interface AdapterCapabilities {
+  driveMode: "core_owned" | "host_driven";
+  durableEventExport: boolean;
+  durableMarkers: boolean;
+  safeRequestGate: boolean;
+  contextRewrite: "none" | "regions" | "full_working_view";
+  requestCapture: "working_view" | "model_messages" | "provider_payload";
+  branchLifecycle: boolean;
+  nativeResume: boolean;
+  workerDispatch: boolean;
+  actionReconciliation: boolean;
+}
 ```
 
-EvidenceRef 同样来自对接协议。Router 首先负责“当前目标需要哪些信息”；delegate 只有在 adapter 支持 spawnChildren 且当前授权允许时启用。第一版可用规则实现 Router，再替换为模型策略。
+projectedThrough 只是当前工作副本的消费位置，进程恢复以 Memory context 的 coveredEventSequence 为基准。不能因为本地检查点记载“已消费”就跳过尚未持久化的上下文增量。
 
-Context Controller 按实际模型 token 预算选择材料并保留输出余量。system prompt、工具定义、最新用户目标及必须遵守的约束从 Host 读取并保护；不允许记忆内容覆盖权限。
+## 5. 持久化、恢复与能力边界
 
-CLM 能力向模型开放 `context.inspect`、`context.edit` 等 Host 工具：模型可以自由重写可编辑区域、组织状态表、移出冗余内容及重新读取证据，修改经准备/应用/激活后进入下一轮输入。文件形式只是后续可选入口，语义与 ContextPatch 相同。
+本地 stateDir 保存 hostInstanceId、用户与 SessionKey 到 binding 的映射、事件 ID/序号、未确认批次、待激活计划及 marker。用户切换项目不会改变映射；切换账号必须选择对应用户的绑定。
 
-编辑校验包括：baseVersion 与 Host 位置未过期、保护块完整、来源可读、工具调用/结果成对、token 不超限，以及被移出内容已存于原始记录。不支持的 vendor 私有块作为不可编辑单元处理。
+恢复时先核对 Memory head、writer 和本地 marker，再补传事件，重放未覆盖增量，并重建 turn/task/action 状态。未知工具结果由 Driver 查询执行环境；未知任务投递由 Task Controller 按 taskId 核对。完整顺序见[协议恢复步骤](integration-protocol.md#72-恢复步骤)。
 
-Memory Agent 的长期整理不直接触发活动上下文重写。Core 拉取失效信息，在下一请求边界重新读取材料；关键用户纠正立即进入受保护的本轮目标与约束。
+| 适配等级 | 可提供能力 |
+| --- | --- |
+| Sync / Recall | 导出记录、检索注入；Host 自行执行，不能宣称受控 Router/Worker loop |
+| Controlled loop | 请求 gate、上下文改写、动作关联；Core 决定每一步，Host 执行 |
+| Recoverable orchestration | 在上述基础上支持持久 marker、任务分派与动作核对，满足完整恢复契约 |
 
-## 6. dsh 适配
+第一版的完整 Router/Worker 行为以 Core-owned 参考 Driver 为基线验证，再验证 Host-driven 映射。参考 Driver 仅实现模型、工具和动作回调，不额外建设通用任务平台或第二套应用界面。
+
+## 6. dsh 与 pi 接入
+
+以下扩展点沿用 2026-11-16 的资料核对结果，仅为候选映射。完整 Host-driven 支持需固定版本，并验证 Core 的请求控制、结果关联和 Worker 分派能否通过这些扩展点实现。
+
+### 6.1 dsh 适配
 
 核对日期：2026-11-16，依据官方仓库 master 文档。这里给出候选映射；实现时需固定 Host 版本，并通过契约验证后才声明支持能力。
 
@@ -198,7 +336,7 @@ dsh 使用追加 session log 派生模型消息；surface replacement 可以改�
 
 插件依赖公开 Agent 接口而非具体 agent-loop 实现。请求 gate、上下文应用确认和 capture 覆盖范围要在固定版本上验证；只有检索注入时按 Recall 等级发布。[核心扩展点](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/core.md)、[插件 cookbook](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cookbook/extension-cookbook.md)
 
-## 7. pi 适配
+### 6.2 pi 适配
 
 核对日期：2026-11-16，依据 earendil-works/pi 官方 main 文档。pi adapter 以原生 TypeScript extension 加载。
 
@@ -216,35 +354,26 @@ context handler 之间会链式变换，不能假设本插件一定最后执行�
 
 pi 会话通过 id/parentId 表达树状历史。只导出当前分支对应的可见路径，并保存原生位置；导航到旧节点后另起执行分支时创建新的 binding。持久 marker 是插件元数据，不应被当成重复的用户消息注入模型。[Session 格式](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md)
 
-## 8. 插件配置与扩展点
+
+## 7. 配置与交付
 
 ```typescript
 interface HarnessConfig {
   memoryEndpoint: string;
-  credentialRef: string;
-  stateDir: string;               // 插件本地持久目录，保存身份与同步恢复数据
-  scope: Scope;
+  credentialRef: string;          // 解析为已认证 user；Worker 使用受限委托
+  stateDir: string;
+  driveMode: "core_owned" | "host_driven";
+  defaultProjectId?: ID;          // 任务/notes 默认标签，不是 Router 检索边界
   syncMode: "strict" | "buffered";
   contextMode: "recall" | "rewrite";
   routerStrategy: string;
-  contextPolicy: string;
   maxContextTokens: number;
+  maxWorkerSteps: number;
 }
 ```
 
-Scope 来自对接协议。配置先做能力协商，例如 strict + rewrite 不能在没有安全请求 gate 的 adapter 上静默启动。
+首次连接协商 Memory 与 Adapter 能力。driveMode 与实际 Driver 不一致、strict 所需 gate/marker 缺失或委派能力不可用时，不以完整编排模式启动。
 
-扩展点限定为 Host Adapter、Router Strategy、Context Policy 和 Memory Client transport。第一版不额外建设通用插件依赖管理平台；Host 负责插件发现、安装和卸载。
+交付顺序为 Core 状态机与模拟 Driver、独立参考 Driver、pi/dsh Host-driven Adapter。验收使用相同输入轨迹，比较事件、动作、context 与任务投递；特别验证每个模型请求只发生一次驱动、最终消息已保存、重启不会丢失轮次与任务关联。
 
-卸载时取消本插件的辅助调用，停止注册的 hooks，保存未同步位置并释放 lease。失败退出依赖原生日志和 spool 恢复，不依赖 shutdown 必然执行。Memory notes 不会被解析为要加载的插件代码。
-
-## 9. 最小交付与验收
-
-1. Core 与模拟 Host/Memory：事件同步、候选保存、激活和故障窗口可验证。
-2. pi adapter：先 Recall，再在固定版本上验证 rewrite、marker 与 gate。
-3. dsh adapter：先公开事件与注入，再验证 surface/compaction 接入。
-4. 同一用户在同一项目接入两个 Host，可读取同一条私有记忆，各自工作上下文与分支独立；另一用户只能读取已授权共享的记忆。
-
-每个 adapter 必须检查：原始记录不丢、实际输入按声明变化、用户纠正不被压缩掉、工具交换有效、分支映射正确、重启不重复同步、其他插件不会无声覆盖本插件效果。
-
-Core 不宣称替 Host 实现任意工具的 exactly-once 执行，也不在 Memory 恢复时重新发起 Host 工具。恢复时读取执行结果和上下文版本；未知外部结果仍由 Host 核对。
+插件卸载保存本地未确认数据、取消可取消动作并释放 lease。崩溃恢复不依赖 shutdown hook 必然执行。Memory notes 作为数据读取，不作为动态插件代码执行。
