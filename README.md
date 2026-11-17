@@ -1,14 +1,14 @@
 # Genvagent
 
-Genvagent 包含 **Agent Harness** 与独立的 **Memory System**。用户与 Router 对话；Router 使用统一用户记忆，决定直接处理、新建工作状态、继续既有 session 或从旧状态分叉。
+Genvagent 包含 **Agent Harness** 与独立的 **Memory System**。Router 负责对话、路由和汇总，异步任务交给 Worker；Worker 独立循环并把进度、结果和 context 保存到统一用户 Memory。
 
-Worker 是可替换的执行进程。业务状态保存在 Memory 的 session/context 与记录中；任务结束可以释放进程，之后由另一个进程继续。用户画像、短期/长期记忆和 notes 属于用户记忆的不同视图或表达方式，集合与项目分类均可选。
+Worker 进程可以替换，持久 session/context 可以继续或分叉。第一版采用 **消息追加 + compact**，使用后台 Session Maintenance 管理退役；CLM 与资源虚拟化延后。
 
 当前阶段：架构设计，尚未实现运行时代码。
 
-- [整体架构与概念模型](docs/architecture.md)
-- [交互逻辑、接口函数与数据结构](docs/integration-protocol.md)
-- [Harness Core、Router CLM 与运行时接入](docs/agent-harness.md)
-- [Memory 对象、视图、整理与部署](docs/memory-system.md)
+- [整体架构与职责](docs/architecture.md)
+- [交互顺序、函数与数据结构](docs/integration-protocol.md)
+- [Router/Worker 循环与 Host 接入](docs/agent-harness.md)
+- [Memory 存储、退役与 notes 维护](docs/memory-system.md)
 
-首个联合验证目标：无项目/集合也能使用；P1 执行后释放，P2 能继续同一 session；新建、继续、分叉和退役分别保持明确语义；Router 的 context 编辑实际影响下一模型输入。
+首个联合验证目标：Worker 工作时 Router 仍可响应；任务状态与通知可靠；新进程可从 checkpoint 继续；后台退役保留退出记录，notes 的整理和删除独立处理。

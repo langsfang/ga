@@ -1,8 +1,8 @@
 # Genvagent：统一用户记忆与可恢复的 Agent 执行
 
-状态：设计草案 v0.6；2026-11-17。当前仓库仅包含设计文档。
+状态：设计草案 v0.7；2026-11-17。当前仓库仅包含设计文档。
 
-Genvagent 包含两个系统：**Agent Harness** 管理 Router、任务路由、执行循环和工作上下文；**Memory System** 按 user 保存证据、可复用记忆及持久执行状态，独立部署于单机或集群。系统不要求用户有项目，也不限定为编程场景。
+Genvagent 包含两个系统：**Agent Harness** 管理 Router、任务路由、执行循环和工作上下文；**Memory System** 按 user 保存证据、可复用记忆及持久执行状态，独立部署于单机或集群。
 
 ## 1. 用户记忆的概念模型
 
@@ -43,7 +43,7 @@ User Memory
 
 ## 2. Process、Session、Context 与 Task
 
-用户只与 Router 对话。Router 使用自己的持久 session/context 理解请求，选择直接处理、创建新的任务 session，或继续已有 session。实际工作由可替换的 Worker 进程执行。
+用户只与 Router 对话。Router 使用自己的持久 session/context 理解请求，负责回应、澄清、分派和汇总；事务性工作交给可替换的 Worker 进程执行。Router 不因等待 Worker 而阻塞后续用户输入。
 
 | 概念 | 含义 | 是否跨进程保留 |
 | --- | --- | --- |
@@ -52,7 +52,7 @@ User Memory
 | Context | Session 的工作状态，包括目标、约束、证据、进度和消息视图 | 是，以不可变版本及当前指针保存 |
 | Task | 一次要完成的工作；Router 决定在哪个 session 上执行 | 是，独立于进程与 context 的寿命 |
 | Run | 某进程在某 session 上的一次执行尝试，受 lease 约束 | 执行记录保留，运行占用可结束 |
-| Runtime binding | dsh/pi 原生 session 与逻辑 session 的适配映射 | 可保留用于定位；不定义逻辑 session 的身份 |
+| Host session link | dsh/pi 原生会话到逻辑 session 的定位关系 | 只用于插件接入与恢复，不代表执行已经开始 |
 
 第一版一个逻辑 session 对应一个记录流和一条 context 版本序列。同一 session 可以先后执行多个 task；一个 task 重试或换进程时可以产生多个 run。并行探索使用独立 session 或分叉，不允许两个进程同时写同一个 session。
 
@@ -62,144 +62,156 @@ task A ── run 1 / process P1 ──┐
 task B ── run 2 / process P2 ──┘
 
 process P1 也可以在释放后执行另一个 session。
-进程替换不创建新的业务 context；选择新目标或分叉才创建。
+进程替换不创建新的业务 context；选择独立目标或分叉才创建。
 ```
 
 “Worker 无状态”指它不独占跨执行的业务状态，不是执行期间没有内存、工具句柄或文件。进程退出后，业务状态从 Memory 恢复；外部工具、工作区和操作系统进程仍需运行时核对。
+后续可用独立资源管理进程代管文件句柄、子进程等资源，并向 Worker 提供稳定引用，降低进程替换的影响。这属于资源虚拟化扩展，第一版保留现有执行环境并核对外部状态，不实现该层。
 
-## 3. Router 的路由与上下文管理
+## 3. Router 保持可响应，Worker 执行事务
 
-### 3.1 路由对象是 session/context
+### 3.1 Router 的职责与路由选择
 
-Router 先读取用户画像摘要、当前对话、有关记忆和 session 目录，再决定任务去向。它选择的是工作状态及执行策略，进程由运行时按能力分配。
+Router 执行有界的对话与调度步骤：理解请求、读取必要记忆、查询任务、澄清、分派及组织答复。长时间检索、文件操作、复杂分析和业务工具调用由 Worker 执行。Router 自己可以调用记忆查询和任务控制接口，但不承担这些事务的执行循环。
 
-| 路由结果 | 使用条件 | 对持久状态的操作 |
+| 路由结果 | 选择条件 | 操作 |
 | --- | --- | --- |
-| 直接处理 | 当前 Router context 足以完成请求 | 继续 Router session，无须创建 Worker |
-| 新建 | 独立问题、无合适历史状态，或需要隔离干扰 | 创建 session/context，以任务目标和选定证据初始化 |
-| 继续 | 已有 session 的目标、进度和执行环境仍适用 | 取得原 session 的写入 lease，加载当前 context 与增量 |
-| 分叉 | 从既有进度探索另一方案，或需要并行执行 | 从固定 ContextRef 创建新 session/context，记录来源 |
-| 等待或澄清 | 目标不明确、session 正忙或外部动作未决 | 保留请求，不抢占已有执行或猜测工具结果 |
+| 回应用户 | 确认收到、解释现有结果、回答状态或澄清问题 | 使用 Router context 生成回复 |
+| 新建工作 session | 新目标独立，或旧状态会造成干扰 | 创建 session，交给 Worker |
+| 继续已有 session | 目标连续，已有进度有效，格式、授权和环境兼容 | 将新工作分配到原 session |
+| 分叉 | 需要保留原方案，或并行探索 | 从固定版本创建新 session |
+| 排队或澄清 | 目标不明确，或选定 session 正忙 | 记录待处理请求；不抢占写入、不猜测外部结果 |
 
-继续既有 session 不要求找到原来的 Worker。Router 依据 session 摘要发现候选，再精确读取状态；开始执行时校验版本、生命周期、授权和未完成动作，不能仅凭语义相似度恢复。
+“追加还是新建”有三个层次：每条完成消息追加到事件流；同一工作继续时更新原 context 并保存新版本；只有独立工作或分叉才创建新的 session/context。token 变多时执行 compact，不以新建 session 代替压缩。
 
-### 3.2 CLM 在 Router 中的作用
+如果用户纠正正在执行的任务，Router 把纠正写入该 task 的持久输入队列。Worker 在安全边界读取并处理，Router 不直接写入正在被 Worker 占用的 session。
 
-CLM 将当前上下文作为模型可编辑的对象，编辑结果进入后续模型输入，并扩展到多上下文协作。[原论文](https://arxiv.org/html/2609.37725v1)、[官方实现](https://github.com/facebookresearch/context-language-models)
+### 3.2 对话 turn 与异步 task 分开
 
-本项目据此提出以下 Router 设计；这是待验证的应用方案：
+用户输入触发一个短 Router turn。分派函数在任务已经持久化后立即返回 taskId，Router 可以回复“任务已接收”并结束本 turn；task 由 Dispatcher 安排执行。Worker 结果到达后，通过新的任务通知触发 Router turn，Router 再向用户汇总。
 
-- Router 可检查、改写自己的工作 context，维护当前意图、重要约束、候选 session、证据缺口和任务进展。
-- Router 可按引用读取其他 session 的摘要或固定快照，决定继续、分叉或新建，再组织目标 session 的初始输入。
-- 检索先补充证据，context 编辑再决定哪些信息实际进入下一轮；不是把全部记忆一直追加到 prompt。
-- Core 负责来源、版本、工具交换与受保护约束校验。Router 不能通过编辑一份摘要直接改写被另一 Worker 占用的 context。
+delegate 的工具结果表示“任务已接收”，不能一直挂起到 Worker 完成。Worker 最终结果作为新的通知引用原 taskId 和来源 turnId，不冒充旧工具调用的第二次结果。
 
-第一版将可编辑内容暴露为 context 工具；可选文件视图只是同一对象的编辑入口。修改必须通过保存、应用和确认，才能影响下一次调用。CLM 不代替 session 目录、并发控制或原始证据存储。
+Router session 的消息更新仍然串行，但它不等待 Worker 的完整 loop。新用户输入与任务完成通知进入 Router inbox，按顺序短时处理；普通心跳不触发模型调用。运行中的模型请求也不被并发修改，纠正与取消在安全边界生效。
 
-质量评估比较固定摘要策略与 CLM Router，在相同模型和预算下测试：任务分派是否正确、旧 session 是否选对、关键约束是否保留、无关历史是否干扰，以及延迟和 token 成本。论文结果不直接证明本系统的路由质量已提高。
+## 4. loop、执行环境与接入方式
 
-## 4. 两大系统与执行 loop
+**执行环境（Runtime）** 是模型客户端、工具、进程、工作目录和权限等能力的实现，不是“一个 session 的另一份状态”。Runtime Driver 是 Core 调用这些能力的接口。**Run** 则是某个进程处理某个 session 的一次执行记录，两者不是同一个概念。
+
+Worker 有自己的执行循环：构建输入 → 调用模型 → 处理工具 → 保存输出 → 更新 context → 下一步。Router 有独立的对话事件循环，两者共用 Core 的记录和上下文组件，但调度互不等待。
+
+| 运行方式 | 谁调用下一次模型/工具 | Core 如何参与 |
+| --- | --- | --- |
+| 独立运行 | Genvagent Runner 调用 Driver 的模型与工具接口 | Core 处理每次结果并决定下一步 |
+| 作为 dsh/pi 插件接入 | Host 原有 loop 发起调用 | Adapter 在请求前调用 Core 准备输入，在完成后把结果交给 Core |
+
+前者对应旧称 Core-owned，后者对应 Host-driven。区别是底层调用由谁推进，不是两套业务状态。一个 run 只用一种方式；插件接入时不能再由 Runner 重复调用模型。
+
+Host session link 只是“这个原生会话对应哪个逻辑 session”的索引。建立索引不启动模型、不获得写入权；换进程加载已有 session 时仍要取得 session lease、读取 context 并核对外部状态。
+
+## 5. 两个 loop 如何同步状态与 context
 
 ```mermaid
-flowchart TB
-    U[User] --> R
-    subgraph H["Agent Harness"]
-        R[Router / Turn Controller]
-        L[Agent Controller / logical loop]
-        S[Session / Task Controller]
-        C[Context Controller]
-        MC[Memory Coordinator]
-        D[Runtime Driver / Host Adapter]
-        W[可替换的 Worker processes]
-        R --> L
-        L <--> S
-        L <--> C
-        S --> MC
-        C --> MC
-        L <--> D
-        D <--> W
-    end
-    MC --> A
-    subgraph M["Memory System"]
-        A[API / Session Registry]
-        E[(用户证据 / 记忆条目 / session 与 context)]
-        Q[Profile / Recall / Session Discovery]
-        B[Memory Agent / Validator]
-        A --> E
-        A --> Q
-        Q --> E
-        E <--> B
-    end
+flowchart LR
+    U[User] <--> R[Router loop]
+    R --> T[Task Dispatcher]
+    T --> W[Worker loop]
+    R --> M[(Memory)]
+    W --> M
+    M --> N[持久任务通知]
+    N --> R
+    M --> L[Session Maintenance]
+    L --> M
+    M --> A[Memory Agent]
+    A --> M
 ```
 
-Harness Core 包含 Turn Controller、Agent Controller、Router Policy、Session/Task Controller、Context Controller 和 Memory Coordinator。Core 拥有逻辑 loop：接收输入、决定下一动作、提交 context、处理结果和结束执行。
+### 5.1 Worker 暴露什么状态
 
-**Host** 是 dsh、pi 等完整 agent 应用。Runtime Driver/Host Adapter 提供模型调用、工具、权限、进程及原生会话适配。Core-owned 模式由 Runner 推进 Core；Host-driven 模式由安全边界的回调推进 Core，并由 Host 执行被允许的下一步。一个 run 只使用一种驱动方式。
+Router 需要任务的状态与结果，不需要持续接收全部 Worker prompt。Worker 将状态事件与原始消息写入 Memory；Memory 在同一事务更新可查询的 TaskSnapshot。
 
-Host 原生 session 是执行容器，逻辑 session 是持久工作身份。新的运行容器可以显式挂载已有逻辑 session，但需验证格式和外部执行环境兼容性。仅支持检索注入的 Adapter 不宣称具备完整上下文恢复能力。
+| 状态信息 | 保存时机 | Router 如何使用 |
+| --- | --- | --- |
+| queued / running / waiting_input / completed / failed / canceled | 状态改变时 | 查询任务，决定继续、询问或汇总 |
+| 当前阶段、完成步骤、简短进度 | 重要步骤或阶段完成时 | 回答用户状态问题，必要时检查证据 |
+| 最新 checkpoint、事件位置、结果引用 | checkpoint 或结果提交后 | 按需精确读取 Worker 的工作状态 |
+| 运行活动时间、lease 有效期 | 运行时心跳 | 判断是否需要核对；失联不直接等于失败 |
 
-## 5. 每轮执行与 context 生命周期
+等待用户、完成和失败等重要变化进入持久通知队列；普通进度可以合并。Router 通过任务查询或变化订阅取得状态，通知丢失后可以重读 snapshot。Worker 的具体消息、工具交换与 context 继续保存在自己的 session 中。
 
-### 5.1 执行顺序
+### 5.2 每一步的持久化顺序
 
 ```text
-用户输入 → 持久化消息 → 更新 Router context → Router 决策
-  ├─ 直接回答
-  └─ 选择 new / resume / fork
-       → 确定持久 session/context
-       → 分配 Worker process，建立 run 并获取 session lease
-       → 加载 context 与未覆盖事件，核对未完成动作
-       → 按需检索，追加或编辑 context，提交版本
-       → 执行模型与工具，持续保存消息和进度
-       → 保存结果与最终 checkpoint，结束 run，释放进程占用
-       → 结果送回 Router，附 task / session / run / context 引用
-  → Router 汇总答复，保存 checkpoint 与 turn 终态
+Worker 完成一条消息或工具结果
+  → appendEvents：保存原始事件，更新任务进度
+  → appendMessages：更新当前进程的 context 工作副本
+  → 需要时 compact：保留目标、约束、工具关系与来源
+  → saveCheckpoint：保存快照并推进“最新已持久化版本”
+  → Driver 根据该快照准备实际模型输入
+  → 记录请求使用的 checkpoint 和输入覆盖范围
+  → 发起模型调用，完成后回到本循环
 ```
 
-每条完成消息先通过 appendEvents 保存原始事件，再由 appendMessages 更新工作副本。下一模型调用前以及 run/turn 正常结束前提交 checkpoint。进程突然退出时，从最后已确认版本和后续事件恢复。
+checkpoint 表示已保存的工作状态，不表示模型已经执行。加载 context 和调用模型由 Harness/Driver 完成；Memory 无须参与一次“激活运行时”的流程。下一模型调用前、正常暂停或任务完成前都保存 checkpoint。
 
-例如用户之前规划了一次旅行，session S 保存了预算、候选方案和未决问题。今天用户说“继续之前的行程”，Router 可以让新进程 P2 继续 S；如果用户要比较另一套方案，则从 S 的固定版本分叉 S2。用户另问一个无关问题时可以新建 S3，S 不因此被删除或退役。
+例如 e-41 已保存，但快照只覆盖到 e-40，新进程就读取快照并补入 e-41。若快照已保存但请求尚未发出，可以从该快照准备请求；不能因此把模型调用或工具动作记成成功。
 
-### 5.2 创建、继续与退役
+## 6. 谁管理 session 退役
 
-| 情况 | Session / context 的处理 |
+### 6.1 独立的后台维护任务
+
+**Memory System 内的 Session Maintenance 任务负责主动检查和退役 session。** 它与 Router、在线 Worker 分开，使用现有后台任务进程运行，不新增第三个系统。它执行生命周期规则；需要提取知识时把工作交给 Memory Agent。
+
+触发来源包括 task/run 结束后的维护事件、一次性 session 的完成事件、显式退役请求，以及定时扫描闲置 session。Router 可以提出请求，但不在对话 turn 中执行清理。
+
+| 情况 | 默认处理 |
 | --- | --- |
-| 首次独立工作 | 新建 session、空 context 序列，写入目标与授权证据后生成首个版本 |
-| 同一工作继续 | 沿用 sessionId/contextId，在已有记录和版本上追加新进度 |
-| 并行或替代方案 | 从明确版本分叉；新流从自己的序号起步，原 session 不变 |
-| 普通追加或 CLM 编辑 | 在同一个 contextId 下生成新版本；旧版本保留可追溯引用 |
-| 一次 task 完成或进程释放 | run 结束，session 默认保持 open 且空闲，可继续使用 |
-| 一次性工作无需继续 | 结果与 checkpoint 已保存、没有未决动作后，按策略退役 |
-| 状态已被新 session 替代或长期无用 | 保留最终摘要、来源和替代关系后退役；空闲时长仅作为候选条件 |
-| 已退役工作重新需要 | 读取历史作为证据，或从固定版本分叉；不直接向退役 session 写入 |
+| 可复用 session 的任务完成 | 保持 open，释放进程；后续可以继续 |
+| one_shot 工作已经结束 | 加入退役检查队列 |
+| 长期空闲、明确被替代或显式请求 | 产生维护候选，不直接删除 |
+| 有活动 lease、排队输入、未完成 task 或未知工具结果 | 跳过并等待状态变化，不能退役 |
+| 已退役的工作需要再次使用 | 只读历史，从固定版本分叉或选择材料新建 |
 
-**Session 的持久生命周期为 open / retired；是否正在执行由有效 run/lease 决定。** 进程退出、工具暂时不可用、task 完成和 context 压缩都不自动等于退役。
+### 6.2 具体退役流程
 
-退役冻结该 session 的继续执行能力，不删除记录、版本或长期记忆。变更必须检查 session revision、context head、最后接收位置、排队输入、未完成任务及未决动作，防止与新执行竞争。未完成工作须先明确取消或转交并保存结果，不能因没有活动进程就视为结束。物理删除由独立保留与删除策略处理。
+1. 维护任务读取 session、任务状态、最新 checkpoint 和事件位置。
+2. 确认无活动执行、待处理输入和未决工作；必要时等待 Core 处理或核对，后台任务不猜测工具结果。
+3. 生成持久的 **SessionExitRecord**：结束原因、最终进度、结果与 checkpoint 引用、证据及可选替代 session。没有值得总结的内容时可用结构化记录。
+4. 在一个条件事务中重新检查版本与上述前提，保存 exit record、将 session 标记 retired，并发布变化。与新执行竞争失败时重新检查。
+5. 若存在值得复用的信息，另外创建记忆整理任务；失败或没有产出都不撤销已经完成的退役。
 
-旧 context 版本被新版本取代，与整条 context/session 退役是两回事。短期内容是否提炼为长期记忆，也不由进程或 session 是否退役决定。
+SessionExitRecord 是必需的结束记录，长期 note 是可选的知识产物。session 退役保留原始记录和 context 版本，不要求提前生成一份长期 note，也不删除已有 notes。
 
-## 6. 状态责任与存储边界
+### 6.3 notes 的 compact 与删除
 
-| 状态 | 更新责任 | 持久化依据 |
+| 操作 | 负责方 | 处理方式 |
 | --- | --- | --- |
-| session 身份、生命周期及 context 关联 | Core 决策，Memory 校验提交 | Session Registry 与版本指针 |
-| turn、task、run、动作及结果 | Harness Core | Memory 事件与执行记录 |
-| 工作 context、约束及进度 | Router/Worker 经 Context Controller 编辑 | 不可变版本、来源与消费位置 |
-| context 在某进程中已加载和应用 | Driver / Adapter | 带 run/epoch 的应用 receipt 与本地 marker |
-| 事实、偏好、经历和 notes | Memory Agent / Validator | MemoryItemRevision 与失效状态 |
-| 用户画像、短期/长期视图、集合目录 | Memory 查询与整理模块 | 基于条目、session 与来源派生，可重建 |
-| 未确认批次、事件映射与原生关联 | Memory Coordinator | 本地持久日志，用于可靠投递与核对 |
-| 工具外部状态、文件、运行进程及凭据 | Runtime / Host | 执行环境与其恢复机制；凭据不进入 Memory |
+| 修订与 compact | Memory Agent + Validator | 生成新修订或合并条目，保留来源及旧版本；被替代条目退出默认检索 |
+| 过期或低价值归档 | Memory 维护策略 | 标记 archived，按需历史查询 |
+| 来源失效 | Memory 失效处理 | 标记依赖 stale，等待修订或停止使用 |
+| 按请求或保留策略删除 | Memory 删除任务 | 先屏蔽读取，再清理规定范围的正文、索引和依赖；历史查询同样受限 |
 
-context 已保存不能证明外部动作成功。替换 Worker 后，未决动作必须先核对；不能通过加载旧快照重放未知结果的工具调用。
+context compact、session retire、notes compact 和物理删除是四种操作。一个 session 完成，不表示其所有记忆应被合并或删除；一次性约束也不能自动成为永久偏好。
 
-## 7. 文档与实施顺序
+## 7. 第一版范围与后续实验
 
-1. [交互逻辑与接口](integration-protocol.md)：new/resume/fork、执行附着、消息保存、context 提交和退役。
-2. [Agent Harness](agent-harness.md)：Router 的 CLM 策略、Session/Task Controller、进程端口和 Host 接入。
-3. [Memory System](memory-system.md)：记忆对象及视图、持久 session/context、检索、整理与部署。
+第一版采用 **消息追加 + compact**。Context Controller 按预算阈值压缩历史，保留当前目标、用户约束、精确标识、未完成工具交换与可取回来源；compact 后仍保存同一 contextId 下的新 checkpoint。
 
-第一版优先验证：无集合用户的普通问答、无状态进程执行新任务、替换进程继续旧 session、分叉不污染原状态、退役后的只读查询，以及 CLM 编辑确实改变下一请求输入。其后验证 dsh/pi Adapter 与后台整理。
+CLM 延后作为对照实验，不作为第一版依赖，也不向模型开放自由编辑 context 的工具。以后在相同模型、输入与预算下比较路由正确率、约束保留、任务质量、延迟和 token 成本。[CLM 论文](https://arxiv.org/html/2609.37725v1)
 
-实现包仍保持 protocol、memory-client、harness-core、runtime-driver、adapter-dsh、adapter-pi 和独立 memory service；不额外引入通用分布式任务平台。
+文件句柄等资源虚拟化同样延后。第一版重点验证：Router 持续响应、Worker 独立循环、任务状态可查询、消息与 context 可恢复、new/resume/fork 正确，以及后台退役和记忆维护。
+
+## 8. 状态归属与文档
+
+| 状态 | 管理方 | 持久依据 |
+| --- | --- | --- |
+| task、进度、输入队列和通知 | Harness 决策，Memory 保存与查询 | TaskSnapshot、事件、输入与通知记录 |
+| session、lease 与最新 checkpoint | Core 使用，Memory 条件提交 | session 元数据、写入租约和 context 快照 |
+| 模型输入及动作结果 | Driver/Core | 对应 checkpoint 的请求记录、原始输出和工具回执 |
+| session 退役 | Session Maintenance | 维护 job、SessionExitRecord、生命周期变化 |
+| 记忆整理、notes 修订与删除 | Memory Agent / 维护任务 | 带来源修订、状态、失效和保留策略 |
+| 外部工具、文件和活跃进程 | 执行环境 / Host | 执行日志、外部状态与恢复机制 |
+
+1. [交互逻辑与接口](integration-protocol.md)：按消息同步、任务协作、checkpoint 和维护划分接口。
+2. [Agent Harness](agent-harness.md)：Router/Worker 两个 loop、compact 基线和接入方式。
+3. [Memory System](memory-system.md)：存储、任务视图、session 维护、notes 生命周期及部署。
