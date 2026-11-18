@@ -1,19 +1,17 @@
 # Genvagent
 
-Genvagent 由 Agent Harness 与独立部署的 Memory System 组成。Router 接收用户输入并分派任务；Harness 调度 Worker；Worker 的结果经持久收件箱返回 Router。
+Genvagent 由两个系统组成：
 
-当前阶段为架构设计，尚未实现运行时代码。
+- **Agent Harness**：持久化执行。负责任务委派、调度、消息投递和故障恢复，保证面向用户的 Router 不被后台任务阻塞。
+- **Memory System**：统一用户记忆。负责 Context 版本、证据、可追溯的记忆条目，以及检索。
 
-## 当前设计
+当前阶段是概念设计，还没有运行时代码。
 
-- [Agent Harness 架构](docs/agent-harness.md)：任务分派、队列调度、信号与结果回传，以及 dsh 插件接入。
-- [Memory System 架构](docs/memory-system.md)：用户记忆、Context 版本、持久任务与消息、Trace 导入和后台维护。
-- [两系统最小接口协议](docs/integration-protocol.md)：唯一接口规范；13 个在线操作及 2 个 Trace 导入操作。
+## 文档
 
-首版使用 Memory 的事务存储实现调度队列和 Task 收件箱，不依赖额外消息中间件。执行权按具体 Context 版本分配；原始消息、任务结果及恢复状态独立于执行进程。
+1. [概念模型](docs/concepts.md)：顶层概念、状态归属、核心交互与不变量。**建议先读这一篇。**
+2. [Agent Harness 架构](docs/agent-harness.md)
+3. [Memory System 架构](docs/memory-system.md)
+4. [Harness 与 Memory 接口边界](docs/integration-protocol.md)
 
-联合验证重点：Router 在 Worker 执行时仍可响应；同一任务不重复启动；等待父任务释放执行名额；结果先于等待注册也能唤醒；重启和重复投递不丢任务、不重复产生答复；dsh 的实际模型请求与 Memory 版本一致。
-
-## 历史材料
-
-[早期整体设计](docs/architecture.md)和[早期实现参考](docs/integration-reference.md)保留供查阅，其中旧 Session 级锁、History 及函数签名不作为当前实现依据。
+v0.16 及以前的设计材料保存在 [docs/archive/](docs/archive/)，不作为当前依据。新旧术语对照见[概念模型 §7](docs/concepts.md#7-术语对照)。
