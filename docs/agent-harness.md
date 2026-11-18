@@ -1,116 +1,132 @@
 # Agent Harness 架构设计
 
-版本：v0.14 · 状态：架构草案 · 日期：2026-11-18
+版本：v0.15 · 状态：架构草案 · 日期：2026-11-18
 
 ## 1. 系统定位与边界
 
-Agent Harness 将用户输入推进为对话答复和任务结果，负责路由、执行循环、任务调度及运行时接入。系统以可嵌入的 Core 为主体，既可独立运行，也可通过插件集成到 dsh、pi 等宿主。
+Agent Harness 是运行 Agent 的程序框架，负责执行循环、任务调度、模型与工具调用，以及 Memory 接入。Core 是这些执行规则的核心代码；Harness 可独立运行，也可嵌入 dsh、pi 等宿主。
 
-| 边界 | 职责 |
-| --- | --- |
-| Harness Core | 定义执行对象、状态转换、Router/Worker 循环、Context 使用策略和任务协作规则 |
-| Runner / Host Adapter | 驱动 Core，接入进程生命周期、宿主事件和实际调用边界 |
-| Runtime Driver | 提供模型、工具、Worker 执行资源及动作状态核对能力 |
-| Memory System | 持久保存用户资料、Session、Context 版本、执行状态与知识；提供版本领取、提交和恢复依据 |
-
-用户通过 Router 交互。Router 在授权范围内访问统一用户记忆，按需选择跨项目资料；Worker 访问分配任务所需的内容。Harness 本地保存运行副本、连接及临时资源，跨进程恢复状态以 Memory 为准。
+实际工作由 Agent 实例执行，Router 与 Worker 表示实例承担的角色。Memory System 保存 Session、任务、Context 版本及执行状态，并提供版本领取和提交保证。Harness 本地持有运行副本、连接和临时资源，恢复依据来自 Memory。
 
 长期知识维护、Session 摘要和 Trace 导入属于 Memory。文件句柄、工具资源及外部环境的完整恢复不在首版范围内。
 
-## 2. 执行模型
+## 2. 概念模型
 
-### 2.1 执行角色
+### 2.1 Agent 实例与角色
 
-| 角色 | 责任 | 执行边界 |
+**Agent 实例是实际推进工作的运行实体。** 实例具有执行身份、角色配置、当前任务和所领取的 Context 版本，运行执行循环并调用模型与工具。它可以由独立进程承载，也可以是宿主进程中的执行任务；实例与操作系统进程不要求一一对应。
+
+**Router 与 Worker 是角色。** 两种角色共用执行循环代码，通过指令、可用工具和行为约束区分职责。
+
+| 角色 | 实例职责 | 行为约束 |
 | --- | --- | --- |
-| Router | 理解用户意图，回应、澄清、分派、补充任务及汇总结果 | 短对话循环，不同步等待长任务完成 |
-| Worker | 推进具体任务，调用模型与工具，产生结果或待处理问题 | 独立任务循环，可继续分派 subagent |
+| Router | 接收用户输入，回应、澄清、分派、补充任务及汇总结果 | 使用短对话轮次，不同步等待长任务完成 |
+| Worker | 推进具体任务，调用模型与工具，产生结果或待处理问题 | 可连续执行多步，也可分派子任务 |
 
-角色与进程解耦。Worker 是可替换的执行资源，Task 是持久工作身份，Context 版本是执行内容依据。替换 Worker 不改变任务归属，也不创建新的业务 Session。
+用户通过 Router 交互；承担该角色的实例可在授权范围内检索统一用户记忆，Worker 实例按任务需要读取资料。subagent 表示任务中的父子关系，其执行者仍是 Worker 实例。
 
-### 2.2 执行单位
+实例的生命周期独立于工作状态。实例暂停或退出后，任务及 Context 版本仍保存在 Memory；替换实例从指定续接位置继续。持续的 Router 对话也不依赖同一个进程或实例常驻。
 
-| 对象 | 定义 |
+### 2.2 工作与上下文
+
+| 持久对象 | 含义及使用规则 |
 | --- | --- |
-| Turn | Router 处理一次用户输入或重要任务通知的对话轮次，可包含多次 LLM 交互 |
-| Task | 具有目标、约束和完成条件的可调度工作，关联工作 Session、起点及续接版本 |
-| Run | 执行者推进一个 Task 或 Router Turn 的一次执行尝试，绑定驱动方式和执行位置 |
-| Interaction | 一次 LLM 调用的基础版本、追加输入和输出；完成后发布一个 Context 后继版本 |
-| Action | Core 发出的逻辑动作，包括模型调用、工具调用、任务分派、等待或结束 |
-
-一个 Turn 可以分派多个 Task；Task 的生命周期可跨越多个 Turn 和 Run。暂停、重试或更换执行者可建立新 Run。Action 与 Interaction 通过稳定身份关联，动作完成不自动等同于任务完成。
-
-任务输入承载补充、纠正和取消；任务通知承载等待、完成和失败等变化。二者均持久保存，读取不等于处理完成。普通进度用于查询，不逐条触发 Router 模型调用。
-
-### 2.3 与 Memory 对象的关系
-
-| 对象 | Harness 的使用规则 |
-| --- | --- |
-| Session | 一项工作的资料边界；一个 Session 可容纳多个 Task、Worker 和 Context |
-| Context | 用于 LLM 交互的有序内容；读取时指定不可变版本，调用前显式追加本轮输入 |
-| Context 版本 | 每个任务保存自己的续接引用；同一 Context 可有多个并行分支，不使用全局唯一 head |
-| Version Claim | Memory 分配的具体版本执行权；同一版本最多一个有效持有者，不同版本可并行 |
+| Session | 组织一项工作的资料，可容纳多个 Task、Context 和并行执行实例 |
+| Task | 具有目标、约束和完成条件的执行目标；保存父子关系、工作归属、起点及续接版本 |
+| Context 及版本 | 用于 LLM 交互的有序内容；具体版本不可变，由 Memory 保存，实例加载运行副本 |
+| Version Claim | Memory 原子分配的具体版本执行权；同一版本最多一个有效持有者，不同版本可并行 |
 | Event | 执行 Session 内的单一元数据流；正文保存在 Context 或其内容引用中 |
 
-Router 的连续对话可使用独立 Session 和稳定续接位置；分派任务按工作归属选择目标 Session。同一工作的 subagent 默认共享 Session，使用不同 Context 或不同派生版本。fork 不要求新建 Session。
+Task 描述执行目标，Agent 实例是执行者；重新分配执行者不改变任务身份。实例领取确定版本，追加本轮输入，完成 LLM 交互后提交后继版本。每个任务保存自己的续接引用，Context 不设置全局唯一 head。
 
-同一 Router 对话分支的 Turn 按顺序推进；该顺序约束不扩展为 Session 级写入锁。多个 Worker 可以同时推进同一 Session，乃至同一 Context 的不同版本。
+Router 对话可使用独立 Session 和稳定续接位置；分派任务按工作归属选择目标 Session。同一工作的子任务默认共享 Session，使用不同 Context 或不同派生版本。fork 不要求新建 Session。
 
-## 3. Core 架构
+### 2.3 执行记录
+
+| 记录 | 描述范围 |
+| --- | --- |
+| Turn | Router 处理一次用户输入或重要通知的对话轮次，可包含多次 LLM 交互 |
+| Run | 某 Agent 实例推进 Task 或 Turn 的一次执行尝试，关联实例身份、驱动方式和执行位置 |
+| Interaction | 一次 LLM 调用的基础版本、追加输入和输出；完成后发布后继版本 |
+| Action | 执行循环发出的动作，包括模型调用、工具调用、任务分派、等待或结束 |
+
+这些记录描述执行过程，不是额外的 Agent 实例。一个 Turn 可分派多个 Task，Task 可经历多个 Run；更换实例可建立新的 Run。Action 与 Interaction 通过稳定身份关联，动作完成不等于任务完成。
+
+任务输入承载补充、纠正和取消，任务通知承载等待、完成和失败等变化。二者均持久保存，读取不等于处理完成。普通进度用于查询，不逐条触发模型调用。
+
+### 2.4 概念分类
+
+| 层次 | 对象 | 性质 |
+| --- | --- | --- |
+| 运行实体 | Router 实例 R、Worker 实例 W1/W2 | 实际执行工作，具有独立运行状态 |
+| 职责角色 | Router、Worker | 定义实例承担的职责 |
+| 持久对象 | Session、Task、Context 版本、领取和事件 | 定义工作归属、执行内容与协调状态 |
+| 执行记录 | Turn、Run、Interaction、Action | 标识轮次、尝试、交互及动作 |
+| 实现代码 | 执行循环、调度、Driver、Adapter、Memory Client | 随程序运行，不作为额外 Agent 调度 |
+| 行为配置与策略 | 角色指令、工具定义、Router Policy | 影响实例如何作出决定 |
+
+## 3. 架构与实现边界
+
+### 3.1 运行时关系
 
 ```mermaid
-flowchart TB
-    U[应用 / Host]
-    G[Runner / Host 事件驱动]
-    subgraph HC[Harness Core]
-        E[对话与任务入口] --> R[Router Controller]
-        R --> P[Router Policy]
-        R --> D[Task Controller / Dispatcher]
-        D --> W[Worker Controller]
-        R --> C[Context Controller]
-        W --> C
-        D --> M[Memory Coordinator]
-        C --> M
-        R --> M
-        W --> M
+flowchart LR
+    U[用户]
+    subgraph H[Harness 运行环境]
+        R[Agent 实例 R：Router 角色]
+        W1[Agent 实例 W1：Worker 角色]
+        W2[Agent 实例 W2：Worker 角色]
     end
-    U --> E
-    G --> E
-    M --> MS[Memory System]
-    R --> X[Runtime Driver / Host Adapter]
-    W --> X
-    D --> X
-    X --> L[模型 / 工具 / 执行资源]
+    U --> R
+    R -.分派任务，由 Harness 安排.-> W1
+    R -.分派任务，由 Harness 安排.-> W2
+    R <--> M[Memory System]
+    W1 <--> M
+    W2 <--> M
 ```
 
-| Core 组件 | 核心职责 |
+图中实例可位于同一进程或不同进程。每个实例执行 Core 提供的循环，持有自己的运行状态；共享代码不表示共享执行位置，也不要求串行运行。
+
+### 3.2 Core 内部代码模块
+
+| 模块 | 职责 |
 | --- | --- |
-| Router Controller | 消费输入和通知，推进短 Turn，持久保存回复及处理位置 |
-| Router Policy | 基于用户意图、相关记忆和任务状态，提出回应、澄清、新建、继续或分叉决策 |
-| Task Controller / Dispatcher | 持久登记任务，安排执行资源，管理父子关系、排队、并发、取消和恢复 |
-| Worker Controller | 推进任务循环，处理模型与工具结果，决定继续、等待、完成或失败 |
-| Context Controller | 选择确定版本及新增材料，组织追加输入，执行显式 fork、恢复和 compact |
-| Memory Coordinator | 封装 Memory 调用、版本领取、幂等提交、任务输入和通知确认 |
+| 共享执行循环 | 为每个实例读取状态、准备输入、发出动作、处理结果并决定继续、等待或结束 |
+| 任务调度（Dispatcher） | 持久登记任务，选择或创建实例，管理排队、并发、父子关系、取消和恢复 |
+| Context 管理 | 选择确定版本和追加材料，通过 Memory 执行 fork、恢复与 compact |
+| 模型与工具接入 | 定义运行能力端口，由 Runtime Driver 或宿主实现实际调用与结果核对 |
+| Memory 接入 | 封装版本领取、幂等提交、任务输入、通知确认和资料检索 |
 
-Router Policy 可由模型实现，Controller 负责验证并落实决策。模型建议不直接授予执行权，也不构成持久状态变更。
+这些模块属于 Harness 的程序实现，不是独立 Agent。Router 实例与 Worker 实例使用同一组模块，其执行范围和结束条件由角色及任务约束决定。
 
-### 3.1 执行循环归属
+### 3.3 角色配置与路由策略
 
-Router loop 和 Worker loop 的状态转换规则均属于 Core：
+角色配置定义指令、可用工具、资料范围、模型及执行预算。Router Policy 表示在当前上下文中选择回应、澄清、分派或继续任务的行为策略；首版由 Router 指令、工具定义和当前模型交互共同实现，可保留替换策略的扩展点。
+
+| 名称 | 在本设计中的定位 |
+| --- | --- |
+| Router Controller / Worker Controller | 对应角色的执行控制逻辑，统一由共享执行循环承担，不设置独立 Agent |
+| Router Policy | 角色配置与可替换决策策略，不是独立进程，也不要求额外模型调用 |
+
+一次 Router 执行中，共享循环加载上下文并调用模型，模型产生答复或任务操作建议；Core 校验并执行建议，保存结果，再继续或结束。路由判断与执行控制在同一实例的执行过程中配合，不构成两个 agent 之间的调用。
+
+### 3.4 执行循环与运行驱动
+
+执行循环及其状态转换规则属于 Core：
 
 ```text
 读取执行状态 → 准备输入 → 发出 Action → 接收结果 → 提交状态 → 继续 / 等待 / 结束
 ```
 
-Runner 或 Host 提供外层事件驱动；Runtime Driver 执行 Core 决定的模型、工具和资源动作。事件循环的运行位置不改变业务执行规则的归属。
+Runner 或 Host 提供外层事件驱动，Runtime Driver 负责实际调用。独立模式由 Runner/Driver 发起调用；插件模式由 Host 发起调用，Adapter 在请求边界推进 Core。同一 Run 采用唯一驱动方式，避免重复执行同一 Action。
 
-同一 Run 采用唯一调用驱动方式。独立模式由 Runner/Driver 发起调用；插件模式由 Host 发起调用，Adapter 在请求边界调用 Core。两条路径不得重复执行同一 Action。
+同一 Router 对话分支的 Turn 按顺序推进；该约束不扩展为 Session 级写入锁。多个 Worker 实例可并行推进同一 Session，乃至同一 Context 的不同版本。
 
 ## 4. 执行语义
 
 ### 4.1 LLM 交互提交
 
-Router 与 Worker 共用以下协议：
+两种角色的 Agent 实例均通过共享循环执行以下协议：
 
 1. 根据任务或对话续接引用，确认指定版本的有效领取；未持有时向 Memory 原子领取，关联任务时校验其当前状态。
 2. 将用户输入、任务通知、工具结果和选取材料保存为本轮追加输入，调用 startInteraction 建立持久交互。
@@ -122,23 +138,23 @@ Router 与 Worker 共用以下协议：
 
 模型生成的工具调用先作为输出持久化，再交给 Driver 执行；工具结果以关联调用身份保存为 Context 待处理内容，供后续交互使用。结果未知时先核对状态，不将未知结果标记为成功。
 
-### 4.2 Router 循环与异步分派
+### 4.2 Router 角色与异步分派
 
-输入先进入持久队列，并关联稳定的 Router 对话任务及续接位置。Router 为用户输入或重要通知建立 Turn，按需检索用户资料和 Session 摘要，随后执行回应、澄清或任务控制。
+输入先进入持久队列，并关联稳定的 Router 对话任务及续接位置。Harness 安排 Router 实例处理对应 Turn，按需检索用户资料和 Session 摘要，随后通过模型交互决定回应、澄清或任务操作。
 
-任务分派先创建或核对目标 Session、Context 起点和 Task，再按稳定任务身份幂等登记。分派操作返回 `TaskAccepted(taskId)` 后 Router 即可保存回复并结束 Turn；Dispatcher 独立安排 Worker 执行。
+实例提出分派操作后，Core 的任务调度模块创建或核对目标 Session、Context 起点和 Task，并按稳定任务身份幂等登记。操作返回 `TaskAccepted(taskId)` 后，Router 实例即可保存回复并结束 Turn；调度模块独立安排 Worker 实例执行。
 
-Worker 完成后，通过持久通知触发新的 Router Turn。完成结果不作为原分派工具调用的第二次返回。通知身份用于定位唯一 Turn，回复持久化后才确认消费；重复通知复用已有 Turn 和回复记录。
+Task 完成后，通过持久通知触发新的 Router Turn。完成结果不作为原分派工具调用的第二次返回。通知身份用于定位唯一 Turn，回复持久化后才确认消费；重复通知复用已有 Turn 和回复记录。
 
-当前模型调用期间到达的输入保持排队，在后续安全边界处理。Router 不修改正在执行的请求，也不因等待 Worker 完成而阻塞下一轮对话。
+当前模型调用期间到达的输入保持排队，在后续安全边界处理，不修改在途请求。处理下一 Turn 时，可继续使用原 Router 实例，也可安排替换实例从对话续接位置恢复；无需等待已分派任务完成。
 
-### 4.3 Worker 循环与子任务
+### 4.3 Worker 角色与子任务
 
-Dispatcher 从可执行 Task 创建 Run，分配执行资源并领取任务约定版本。领取失败时重新核对任务状态，释放无用资源，不通过另建 Session 绕过冲突。
+调度模块为可执行 Task 选择或创建 Worker 实例，为本次尝试登记 Run，并领取任务约定版本。领取失败时重新核对任务状态，释放无用资源，不通过另建 Session 绕过冲突。
 
-Worker 在交互边界读取未处理输入，按交互提交协议推进。需要并行工作时，创建子 Task 并分配不同版本；从同一内容起点出发的子任务先 fork，再分别领取。父任务可以继续执行，也可以保存续接位置、释放领取并等待结果。
+Worker 实例在交互边界读取未处理输入，通过共享循环推进任务。需要并行工作时，Core 根据分派操作创建子 Task，并由其他实例执行不同版本；从同一内容起点出发的子任务先 fork，再分别领取。父任务的执行实例可以继续，也可以保存续接位置、释放领取并等待结果。
 
-子结果以版本和消息引用交付。父任务从自己的续接版本读取所需结果，核对最新约束后形成新增输入。任务完成持久保存结果、释放领取并发送通知，不自动结束整个 Session。
+子结果以版本和消息引用交付。执行父任务的实例从该任务的续接版本读取结果，核对最新约束后形成新增输入。任务完成持久保存结果、释放领取并发送通知，不自动结束整个 Session。
 
 ### 4.4 补充、取消与恢复
 
@@ -149,7 +165,7 @@ Worker 在交互边界读取未处理输入，按交互提交协议推进。需�
 | 用户补充或纠正 | Router 写入目标任务输入；父任务传播到适用子任务；各分支在安全边界消费，不改写已发布版本 |
 | 取消 Turn | 停止当前对话动作，不自动取消已分派 Task |
 | 取消 Task | 明确目标及子任务传播范围，保存请求并调用 Driver 取消；接收取消不代表外部动作已经停止 |
-| 暂停或更换 Worker | 保存续接引用及待处理状态，释放或回收旧领取；新 Run 重新领取明确版本 |
+| 暂停或更换实例 | 保存续接引用及待处理状态，释放或回收旧领取；替换实例关联新的 Run，重新领取明确版本 |
 | 未完成动作 | 根据持久 Interaction、Task 和 Driver 状态核对结果，再决定重试、继续等待或终止 |
 | Memory 不可用 | 停止发起需要新领取或预先持久化的新动作；已有结果待恢复后核对提交，不确认尚未保存的完成状态 |
 
@@ -172,9 +188,9 @@ Memory Agent 可以提供压缩候选、记忆修订和 notes；Harness 在后�
 | 接口 | 提供方 → 调用方 | 操作与契约 |
 | --- | --- | --- |
 | 对话入口 | Core → 应用 / Host Adapter | openConversation、submitUserMessage、cancelTurn、readReplies；返回稳定对话、Turn 和回复身份 |
-| 任务入口 | Core → 应用 / Router Controller | dispatchTask、getTask、postTaskInput、cancelTask；先持久登记再返回受理结果 |
-| 通知入口 | Core → Memory Coordinator / Host Adapter | acceptTaskNotification；按通知身份恢复或创建唯一 Turn |
-| 执行推进 | Core → Runner / Host Adapter | advance、acceptCompletion；发出下一 Action 或等待状态，按 Action 身份处理结果 |
+| 任务入口 | Core → 应用 / 共享执行循环 | dispatchTask、getTask、postTaskInput、cancelTask；落实实例提出的任务操作，先持久登记再返回受理结果 |
+| 通知入口 | Core → Memory 接入模块 / Host Adapter | acceptTaskNotification；按通知身份恢复或创建唯一 Turn |
+| 执行推进 | Core → Runner / Host Adapter | advance、acceptCompletion；推进指定实例当前的 Run，按 Action 身份处理结果 |
 | 运行能力 | Runtime Driver → Core | allocateWorker、invokeModel、executeTool、cancel、reconcile、releaseWorker；报告真实执行状态 |
 | 宿主接入 | Host Adapter → Runner / Core 装配层 | 声明能力，注册或解除宿主事件、请求边界和原生位置映射 |
 
@@ -197,15 +213,17 @@ Memory 的摘要与生命周期维护不代替 Harness 调度。所有 Harness �
 
 ### 6.1 扩展点
 
+扩展点提供配置或代码实现，在 Agent 实例的执行过程中使用，不单独建立 Agent 身份。
+
 | 扩展点 | 可替换实现 | 约束 |
 | --- | --- | --- |
-| Router Policy | 路由模型、工作选择和任务拆分策略 | 输出声明式路由决定，由 Core 检查并执行 |
+| 角色配置与 Router Policy | 指令、可用工具、模型选择及可替换路由策略 | 由实例应用，产生的任务操作由 Core 检查并执行 |
 | Context Policy | 资料选择、预算和 compact 策略 | 基于确定版本输出新增内容或派生候选，保留约束与来源 |
 | Runtime Driver | 模型、工具和 Worker 执行环境 | 以稳定 Action 身份调用并回报状态，遵守取消和结果核对语义 |
 | Host Adapter | dsh、pi 等宿主的事件及请求边界映射 | 保证单一调用路径、输入边界和结果捕获范围 |
 | Memory Client | 本地或远程连接、认证和传输 | 遵守相同领域接口及一致性契约 |
 
-插件通过注册与能力声明装配，不依赖 Core 的私有实现。Run 绑定实际使用的驱动与策略配置；切换实现须在明确边界记录，不改变在途请求。
+插件通过注册与能力声明装配，不依赖 Core 的私有实现。实例的 Run 记录实际使用的角色配置、驱动与策略版本；切换实现须在明确边界记录，不改变在途请求。
 
 Host 原生会话、分支或消息位置映射到稳定 Task 和 Context 版本引用，不仅映射到 Session。原生导航或 fork 需转换为显式版本操作，不因并行或分叉自动建立新 Session。
 
@@ -215,7 +233,7 @@ Host 原生会话、分支或消息位置映射到稳定 Task 和 Context 版本
 | --- | --- | --- |
 | 记忆检索 | 能请求召回并向宿主提供材料 | 使用统一用户记忆，不接管执行状态 |
 | Trace 导入 | 能导出稳定来源身份和内容快照 | 由 Memory importTrace 建立导入 Session/Context；不创建执行 Event 或领取 |
-| 完整执行接入 | 能在请求前暂停或放行、使用指定输入、捕获结果、处理取消并恢复明确版本 | 运行 Core 的 Router/Worker 循环和版本提交协议 |
+| 完整执行接入 | 能在请求前暂停或放行、使用指定输入、捕获结果、处理取消并恢复明确版本 | 承载 Agent 实例，遵循共享循环、角色约束和版本提交协议 |
 
 完整接入要求 Adapter 对实际发送的上下文负责。Host 后续钩子或自动压缩若会改变输入，必须纳入显式版本与输入记录；无法控制时仅启用已满足的接入范围。compact 由唯一责任方发起，防止 Host 与 Core 重复处理。
 
@@ -225,11 +243,13 @@ dsh、pi 的具体钩子按目标版本验证；本文不假定二者已满足�
 
 ### 7.1 关键数据结构
 
-| 结构 | 关键数据 | 持久归属 |
+| 结构 | 关键数据 | 归属与生命周期 |
 | --- | --- | --- |
+| AgentInstance | 实例身份、角色配置引用、当前任务/Turn、Run、Context 引用及有效领取 | 运行时对象，可退出或替换；执行身份关联 Memory 协调记录 |
+| RoleConfig | 角色、指令、可用工具、模型、资料范围及执行预算 | 可版本化配置；影响模型输入的内容固定到 Context 或输入配置引用 |
 | TurnRef | Turn、输入或通知身份、Router 对话任务、来源与结果版本、回复引用 | Memory 中的任务输入、交互及消费元数据 |
 | TaskSpec | 任务身份、父任务、目标、约束、完成条件、Session、起点版本 | Memory Task |
-| RunState | 执行尝试身份、任务或 Turn、执行者、驱动配置、续接版本、在途 Action | Memory 执行元数据；本地持有运行副本 |
+| RunState | 执行尝试身份、任务或 Turn、实例身份、配置版本、续接版本、在途 Action | Memory 中的一次执行尝试记录，由 Agent 实例推进 |
 | ContextRef / Claim | contextId、versionId、有效执行凭证及期限 | Memory 版本与领取记录 |
 | Action | 动作身份、类型、关联 Run/Interaction、输入输出引用和执行状态 | 持久 Task/Interaction 及动作元数据；Driver 提供实际调用状态 |
 | RouteDecision | 回应或任务操作、目标 Session/Task、版本来源、约束 | Core 验证后落实为对话或任务记录 |
@@ -241,15 +261,24 @@ dsh、pi 的具体钩子按目标版本验证；本文不假定二者已满足�
 
 | 模式 | 驱动关系 |
 | --- | --- |
-| 独立运行 | Runner 驱动 Core，Runtime Driver 执行模型、工具及 Worker 分配 |
-| 宿主插件 | Host 驱动调用，Adapter 在必要边界推进 Core，执行规则仍由 Core 定义 |
-| 多执行实例 | 多个 Dispatcher/Worker 共享 Memory，以任务状态和具体版本领取协调并发 |
+| 独立运行 | Runner 驱动 Agent 实例，实例执行 Core 循环，通过 Runtime Driver 调用模型、工具及分配执行资源 |
+| 宿主插件 | 实例由宿主内执行任务承载，Host 驱动调用，Adapter 在必要边界推进 Core |
+| 多执行实例 | 多个 Agent 实例共享 Memory，以任务状态和具体版本领取协调并发；实例可分布在多个进程 |
 
 输入、通知和调用结果使用稳定身份重试。回复读取返回稳定回复标识，应用层按标识去重；内部幂等提交不等同于网络交付或外部操作的 exactly-once。
 
 ## 8. 数据流与验证范围
 
-用户请求由 Router 的 Turn T0 分派 Task P。持久登记成功后返回 TaskAccepted，Router 保存回复并结束 T0。P 在工作 Session S 内建立两个子任务：
+Router 实例 R0 处理用户输入并开始 Turn T0。共享循环调用模型，得到分派 Task P 的操作；任务调度模块持久登记 P，返回 TaskAccepted，并安排 Worker 实例 W0 执行。R0 保存回复后结束 T0，可继续处理输入或退出。
+
+W0 推进工作 Session S 内的任务 P，进一步分派子任务 A、B，由实例 W1、W2 执行：
+
+| 运行实例 | 角色 | 执行对象 | Context 起点 |
+| --- | --- | --- | --- |
+| R0 | Router | 用户输入对应的 Turn T0 | Router 对话自己的续接版本 |
+| W0 | Worker | Task P | C@v3 |
+| W1 | Worker | 子任务 A | 从 v3 fork 的 C@v4 |
+| W2 | Worker | 子任务 B | 从 v3 fork 的 C@v5 |
 
 ```text
 Context C
@@ -258,17 +287,19 @@ Context C
    └──父任务 P 交互──→ v6 ──追加子结果并汇总──→ v9
 ```
 
-P、A、B 分别领取 v3、v4、v5，执行事件统一写入 S。子任务完成后通知 P；P 从自身续接版本 v6 汇总，提交 v9 并完成任务。顶层通知触发 Router 的新 Turn T1，读取结果并保存用户答复。A 更换 Worker 时从任务记录的确切版本恢复，不影响 B 或 P。
+W0、W1、W2 分别领取 v3、v4、v5，共用执行循环代码，各自维护执行进度，事件统一写入 S。A、B 完成后通知父任务 P；W0 从 P 的续接版本 v6 汇总，提交 v9 并完成任务。
+
+顶层通知触发 Turn T1。原实例 R0 或替换实例 R1 从 Router 对话的持久续接位置恢复，读取结果并保存答复。若 W1 被替换，新实例从 Task A 记录的确切版本继续，A 的任务身份及 B、P 的执行位置均不改变。
 
 | 验证场景 | 判定条件 |
 | --- | --- |
-| Worker 并行执行 | 同一 Session、同一 Context 的不同版本可并行，Router 仍能处理后续输入 |
-| 进程替换与重复提交 | 新执行者恢复任务续接位置；旧领取被拒绝；重复提交不创建新版本 |
+| 实例并行执行 | 多个实例共用循环代码、独立推进不同版本；Router 对话仍能处理后续输入 |
+| 实例替换与重复提交 | 工作身份不变，新实例恢复任务续接位置；旧领取被拒绝；重复提交不创建新版本 |
 | 补充、取消及重复通知 | 输入在安全边界生效；取消范围明确；重复通知复用同一 Turn 和回复 |
 | 插件执行边界 | 同一 Action 只有一条调用路径，实际输入与持久版本一致，原生压缩显式纳入版本 |
 | 不确定结果与服务恢复 | 未确认结果不标记成功，恢复后先核对状态再继续 |
 
-首版包含短 Router 循环、独立 Worker 循环、版本级并发、任务输入与通知、追加和显式 compact，以及独立运行和 Host 适配接口。CLM 路由策略与资源虚拟化作为后续扩展，不改变现有版本和持久化契约。
+首版包含共享执行循环、Router/Worker 角色、版本级并行任务、输入与通知、追加和显式 compact，以及独立运行和 Host 适配接口。CLM 路由策略与资源虚拟化作为后续扩展，不改变现有版本和持久化契约。
 
 ---
 
