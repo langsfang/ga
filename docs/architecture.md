@@ -1,5 +1,7 @@
 # Genvagent：统一用户记忆与可恢复的 Agent 执行
 
+> 历史设计，非当前实现契约。当前设计见 [Harness 架构](agent-harness.md)、[Memory 架构](memory-system.md)与[最小接口协议](integration-protocol.md)。本文中的 Session 级锁、History 和旧接口仅供历史查阅。
+
 状态：设计草案 v0.9；2026-11-17。当前仓库仅包含设计文档。
 
 Genvagent 包含两个系统：**Agent Harness** 管理 Router、任务路由、执行循环和工作上下文；**Memory System** 按 user 保存证据、可复用记忆及持久执行状态，独立部署于单机或集群。

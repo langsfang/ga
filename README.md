@@ -1,16 +1,19 @@
 # Genvagent
 
-Genvagent 包含 **Agent Harness** 与独立的 **Memory System**。Router 负责对话、路由和汇总，异步任务交给 Worker；Worker 独立循环并把进度、结果和 context 保存到统一用户 Memory。
+Genvagent 由 Agent Harness 与独立部署的 Memory System 组成。Router 接收用户输入并分派任务；Harness 调度 Worker；Worker 的结果经持久收件箱返回 Router。
 
-Worker 进程可以替换，持久 session/context 可以继续或分叉。第一版采用 **消息追加 + compact**，使用后台 Session Maintenance 管理退役；CLM 与资源虚拟化延后。
+当前阶段为架构设计，尚未实现运行时代码。
 
-当前阶段：架构设计，尚未实现运行时代码。
+## 当前设计
 
-- [整体架构与职责](docs/architecture.md)
-- [Harness：执行对象、Core、循环与插件边界](docs/agent-harness.md)
-- [Memory 存储、退役与 notes 维护](docs/memory-system.md)
-- [两系统的对象模型、交互接口与完整流程示例](docs/integration-protocol.md)
+- [Agent Harness 架构](docs/agent-harness.md)：任务分派、队列调度、信号与结果回传，以及 dsh 插件接入。
+- [Memory System 架构](docs/memory-system.md)：用户记忆、Context 版本、持久任务与消息、Trace 导入和后台维护。
+- [两系统最小接口协议](docs/integration-protocol.md)：唯一接口规范；13 个在线操作及 2 个 Trace 导入操作。
 
-先理解两个系统各自管理的对象，再阅读[对接接口清单](docs/integration-protocol.md#5-两系统的交互接口)及[行程规划完整示例](docs/integration-protocol.md#6-完整例子规划行程中途纠正换-worker-后继续)。具体 SDK、载荷、传输机制及 Host 钩子保留在[接口实现参考](docs/integration-reference.md)中，尚未冻结。
+首版使用 Memory 的事务存储实现调度队列和 Task 收件箱，不依赖额外消息中间件。执行权按具体 Context 版本分配；原始消息、任务结果及恢复状态独立于执行进程。
 
-首个联合验证目标：Worker 工作时 Router 仍可响应；任务状态与通知可靠；新进程可从 checkpoint 继续；后台退役保留退出记录，notes 的整理和删除独立处理。
+联合验证重点：Router 在 Worker 执行时仍可响应；同一任务不重复启动；等待父任务释放执行名额；结果先于等待注册也能唤醒；重启和重复投递不丢任务、不重复产生答复；dsh 的实际模型请求与 Memory 版本一致。
+
+## 历史材料
+
+[早期整体设计](docs/architecture.md)和[早期实现参考](docs/integration-reference.md)保留供查阅，其中旧 Session 级锁、History 及函数签名不作为当前实现依据。
