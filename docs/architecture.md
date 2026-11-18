@@ -1,6 +1,6 @@
 # Genvagent：统一用户记忆与可恢复的 Agent 执行
 
-状态：设计草案 v0.8；2026-11-17。当前仓库仅包含设计文档。
+状态：设计草案 v0.9；2026-11-17。当前仓库仅包含设计文档。
 
 Genvagent 包含两个系统：**Agent Harness** 管理 Router、任务路由、执行循环和工作上下文；**Memory System** 按 user 保存证据、可复用记忆及持久执行状态，独立部署于单机或集群。
 
@@ -55,6 +55,7 @@ Session 组织 History 与 Context：前者保存经历，后者保存当前如�
 | Session | 持久的逻辑工作线程；关联记录流、context 版本和任务历史 | 是，由 Memory 保存，具有稳定 sessionId |
 | Context | Session 的工作状态，包括目标、约束、证据、进度和消息视图 | 是，以不可变版本及当前指针保存 |
 | Task | 一次要完成的工作；Router 决定在哪个 session 上执行 | 是，独立于进程与 context 的寿命 |
+| Turn | Router 处理一次用户输入或重要任务通知的对话轮次 | 输入、输出与轮次记录保存在 Router Session |
 | Run | 某进程在某 session 上的一次执行尝试，受 lease 约束 | 执行记录保留，运行占用可结束 |
 | Host session link | dsh/pi 原生会话到逻辑 session 的定位关系 | 只用于插件接入与恢复，不代表执行已经开始 |
 
@@ -102,14 +103,14 @@ Router session 的消息更新仍然串行，但它不等待 Worker 的完整 lo
 
 **执行环境（Runtime）** 是模型客户端、工具、进程、工作目录和权限等能力的实现，不是“一个 session 的另一份状态”。Runtime Driver 是 Core 调用这些能力的接口。**Run** 则是某个进程处理某个 session 的一次执行记录，两者不是同一个概念。
 
-Worker 有自己的执行循环：构建输入 → 调用模型 → 处理工具 → 保存输出 → 更新 context → 下一步。Router 有独立的对话事件循环，两者共用 Core 的记录和上下文组件，但调度互不等待。
+Router 和 Worker 的循环推进规则都属于 Harness Core。Worker 负责具体任务的模型/工具步骤，Router 负责短对话与路由；两者共用 Core 的记录和上下文组件，调度互不等待。Core 还包含任务调度、Context 管理和 Memory 协调，具体对象及模块职责见 [Harness 设计](agent-harness.md)。
 
 | 运行方式 | 谁调用下一次模型/工具 | Core 如何参与 |
 | --- | --- | --- |
 | 独立运行 | Genvagent Runner 调用 Driver 的模型与工具接口 | Core 处理每次结果并决定下一步 |
 | 作为 dsh/pi 插件接入 | Host 原有 loop 发起调用 | Adapter 在请求前调用 Core 准备输入，在完成后把结果交给 Core |
 
-前者对应旧称 Core-owned，后者对应 Host-driven。区别是底层调用由谁推进，不是两套业务状态。一个 run 只用一种方式；插件接入时不能再由 Runner 重复调用模型。
+Runner 或 Host 提供事件驱动与底层调用，Core 决定执行如何推进。前者对应旧称 Core-owned，后者对应 Host-driven；一个 run 只用一种方式。完整插件接入要求 Host 在请求边界支持 Core 准备输入、保存状态并决定放行或暂停；不满足时按能力开放检索或同步。插件接入时不能再由 Runner 重复调用模型。
 
 Host session link 只是“这个原生会话对应哪个逻辑 session”的索引。建立索引不启动模型、不获得写入权；换进程加载已有 session 时仍要取得 session lease、读取 context 并核对外部状态。
 
@@ -117,17 +118,25 @@ Host session link 只是“这个原生会话对应哪个逻辑 session”的索
 
 ```mermaid
 flowchart LR
-    U[User] <--> R[Router loop]
-    R --> T[Task Dispatcher]
-    T --> W[Worker loop]
-    R --> M[(Memory)]
+    U[User]
+    subgraph H[Harness Core]
+        R[Router loop]
+        T[Task Dispatcher]
+        W[Worker loop]
+        R --> T
+        T --> W
+    end
+    subgraph MS[Memory System]
+        M[(领域与协作存储)]
+        L[Session Maintenance]
+        A[Memory Agent]
+        L --> M
+        A --> M
+    end
+    U <--> R
+    R --> M
     W --> M
-    M --> N[持久任务通知]
-    N --> R
-    M --> L[Session Maintenance]
-    L --> M
-    M --> A[Memory Agent]
-    A --> M
+    M -.返回状态与通知.-> R
 ```
 
 ### 5.1 Worker 暴露什么状态
@@ -216,7 +225,7 @@ CLM 延后作为对照实验，不作为第一版依赖，也不向模型开放�
 | 记忆整理、notes 修订与删除 | Memory Agent / 维护任务 | 带来源修订、状态、失效和保留策略 |
 | 外部工具、文件和活跃进程 | 执行环境 / Host | 执行日志、外部状态与恢复机制 |
 
-1. [概念模型与能力边界](integration-protocol.md)：先说明对象关系与管理责任，再说明各层接口的提供方、调用方和交互逻辑。
-2. [Agent Harness](agent-harness.md)：Router/Worker 两个 loop、compact 基线和接入方式。
+1. [对象模型、接口与完整流程](integration-protocol.md)：接口提供方、调用方、逻辑操作及从用户输入到记忆整理的实例。
+2. [Agent Harness](agent-harness.md)：执行对象、Core 模块、两个 loop 与可插件化边界。
 3. [Memory System](memory-system.md)：存储、任务视图、session 维护、notes 生命周期及部署。
-4. [接口实现参考](integration-reference.md)：候选函数、载荷和传输机制，待概念模型确认后进一步细化。
+4. [接口实现参考](integration-reference.md)：候选 SDK、载荷、传输机制与 Host 具体适配，尚未冻结。

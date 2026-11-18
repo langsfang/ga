@@ -1,6 +1,6 @@
 # Memory System：用户记忆、持久执行状态与整理服务
 
-状态：设计草案 v0.8；2026-11-17。先读[概念模型与能力边界](integration-protocol.md)；函数与载荷的实现候选见[接口实现参考](integration-reference.md)。本文描述 Memory 内部管理与存储设计。
+状态：设计草案 v0.9；2026-11-17。共享对象及[两系统接口](integration-protocol.md#5-两系统的交互接口)见交互协议；另一侧的执行职责见 [Harness 设计](agent-harness.md)。本文描述 Memory 内部管理与存储，载荷的实现候选见[接口实现参考](integration-reference.md)。
 
 ## 1. 记忆对象与视图
 
@@ -82,7 +82,7 @@ Worker 的 TaskUpdate 来自 appendEvents。服务验证当前 run 与 task 的�
 | TaskInput | Router/Core 或用户授权入口 | Worker 在安全边界读取并确认 |
 | TaskNotification | 重要状态提交时创建 | Router inbox，独立于原 delegate 工具调用 |
 
-postTaskInput 持久保存纠正或取消，不能直接写 Worker context。Worker 实际处理时追加 task_input_applied；输入确认与效果记录一起保存，防止崩溃后丢失输入。
+postTaskInput 持久保存纠正或取消，不能直接写 Worker context。Worker 通过 readTaskInputs 读取待处理输入，实际处理时追加 task_input_applied；输入确认与效果记录一起保存，防止崩溃后丢失输入。
 
 通知 ID 由 task 与状态修订确定，重试不生成新通知。Router 追加对应 task_notification 事件时，同事务保存 deliveredEventId。通知只证明已进入 Router 持久 inbox，不证明用户已经读到回复。
 
