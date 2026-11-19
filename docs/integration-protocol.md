@@ -1,131 +1,184 @@
-# Harness 与 Memory 最小接口协议
+# Harness 与 Memory 交互与接口
 
-版本：v0.16 · 状态：设计契约 · 日期：2026-11-18
+版本：v0.24 · 状态：接口草案 · 日期：2026-11-19
 
-## 1. 边界与原则
+本文定义两个系统的边界、Memory 对外提供的接口，以及 Harness 在各个场景下如何调用这些接口。接口只列出操作、主要输入输出和语义，不定义字段级格式和传输协议。术语见[概念模型](concepts.md)。
 
-Harness 决定任务目标、调度顺序和执行者，负责调用模型与工具。Memory 保存 Context、任务及消息，保证版本唯一领取、持久提交和消息可恢复。Memory 不启动 Worker，也不承担业务调度。
+## 1. 边界
 
-本文是两系统接口的唯一规范。[Harness 架构](agent-harness.md)描述调用流程，[Memory 架构](memory-system.md)描述存储与维护。首版在线接口限定为下述 13 个操作；Trace 导入另有 2 个操作。画像、摘要刷新、压缩建议、生命周期检查等属于读取视图或后台维护，不要求 Harness 调用额外接口。
-
-接口均在已认证用户域内操作。所有写入携带稳定请求身份，重试返回既有结果；版本及消息引用不能跨越未授权用户域。
-
-## 2. 共享对象
-
-| 对象 | 含义 |
-| --- | --- |
-| Session | 一项工作；执行 Session 具有单一元数据 Event 流，导入 Session 不创建 Event 流 |
-| ContextRef | 明确的 contextId 与 versionId；内容不可变，可按来源派生版本 |
-| Task | 可调度执行目标，包含角色、Session、父任务、续接版本、状态及返回地址 |
-| Claim | Memory 授予具体 Context 版本的执行权，绑定 Task、执行者、有效期及执行代次 |
-| Mailbox | 以稳定 Task ID 寻址的持久收件箱；消息正文引用 Context 待处理内容或结果版本 |
-| Message | 稳定消息身份、目标、类型、来源及内容引用；类型包括输入、纠正、取消、恢复和任务结果 |
-
-Task 的主要状态为 queued、running、waiting、paused、completed、failed、cancelled。Router 对话也对应一个长期 Task；没有输入时等待，新输入到达时再次可调度。
-
-Event 用于审计和摘要，Mailbox 用于定向交付；二者不是同一条流。Event 不保存对话正文，Mailbox 不另存一套 Worker History。
-
-<a id="5-对外接口"></a>
-<a id="5-两系统的交互接口"></a>
-
-## 3. 最小在线接口
-
-### 3.1 工作资料：4 个操作
-
-| 操作 | 输入 | 结果及语义 |
-| --- | --- | --- |
-| openSession | 工作目标、初始 Context 内容、请求身份 | 原子创建 Session 及初始 Context，返回固定引用 |
-| read | 对象或内容引用 | 读取 Session 目录与摘要、Task 状态、明确 Context 版本或引用原文；只读，不授予执行权 |
-| deriveContext | 基础 ContextRef、派生类型及明确内容变化 | 创建 fork、compact 或恢复候选版本；默认保持 Context 身份，可建立独立 Context；不移动任何 Task 的续接位置 |
-| recall | 查询、用户内范围和数量限制 | 返回相关历史、摘要或知识及来源；用户概览和画像是查询视图 |
-
-新增独立 Context 通过明确来源派生；openSession 提供初始根版本。deriveContext 只发布版本，是否供某个任务继续使用由版本领取或释放时的条件更新决定。只读操作采用统一引用模型，不提供通用数据库写入接口。
-
-### 3.2 版本执行：5 个操作
-
-| 操作 | 输入 | 结果及语义 |
-| --- | --- | --- |
-| claimContext | Task、预期续接引用、执行者；可指定显式派生的执行起点 | 原子核对 Task 状态并领取具体版本，Task 转为 running，返回内容与 Claim；同时受理对应待调度项 |
-| renewClaim | 当前 Claim | 续期；已过期、失效或被替换的凭证不能续期 |
-| startInteraction | Claim、本轮输入及来源消息 ID、调用身份 | 保存待完成交互和输入，返回交互引用；不得仅保存引用而丢失正文 |
-| commitInteraction | 交互引用、Claim、模型输出及调用结果 | 成功时幂等发布后继版本、完成事件、消息消费确认和 Task 续接位置，并转移领取；失败时保存未完成状态，不确认输入消费 |
-| releaseClaim | 当前 Claim、queued/waiting/paused、可选后续版本及等待条件 | 原子保存续接和等待条件、释放领取；采用派生版本时核对来源与任务修订；未决交互须保留 |
-
-领取对象始终是 `(contextId, versionId)`，不是 Session。不同版本可同时被不同执行者领取。同一 Task 的续接状态也须校验，不能通过旧派发请求重复启动已推进的任务。
-
-版本派生与采用分开：fork 可分配给新任务，compact 或恢复候选只在持有有效执行权或领取时的条件更新中成为指定 Task 的续接版本。旧版本及其他分支保持不变。
-
-### 3.3 任务与消息：4 个操作
-
-| 操作 | 输入 | 结果及语义 |
-| --- | --- | --- |
-| submitTask | 稳定 Task ID、角色、Session、来源版本、目标输入、parentTaskId、returnTo | 原子派生独立起点、保存 Task 和初始输入并登记待调度项，返回 TaskAccepted；无初始输入的 Router Task 进入 waiting |
-| sendMessage | 目标 Task、稳定消息 ID、类型及内容/引用 | 持久保存输入；必要时将等待任务标记为可调度，返回持久受理结果，不代表已处理 |
-| receive | 调度队列或 Task 收件箱、分页位置、等待时长 | 返回待调度任务或未处理消息；允许长轮询，读取和分页不确认消费 |
-| finishTask | Task、有效 Claim 或经核对的取消依据、终态、结果引用 | 原子保存终态、释放领取、追加完成元数据，并向 returnTo 收件箱写入唯一结果通知 |
-
-submitTask 的来源版本必须属于目标工作范围。子任务默认在同一 Session 内派生独立版本，不因并行创建新 Session。顶层任务可以将另一个 Session 内的 Router Task 作为返回地址，但必须属于同一授权用户。
-
-finishTask 的结果必须引用已持久可读的内容。相同终态请求重复提交不重复产生通知；正在运行的任务必须校验执行代次。取消请求已接收不能作为进程已停止的证明。
-
-消息入箱不直接启动实例：waiting 任务满足唤醒条件后转为 queued；running 任务保留消息供下一边界处理；paused 任务仅由有效恢复指令解除暂停；终态任务不自动重启。结果到达、恢复与取消均须按 Task 当前修订更新，不能覆盖并发推进的状态。
-
-## 4. 队列与交付契约
-
-### 4.1 两类逻辑队列
-
-| 队列 | 内容与消费者 | 持久依据 |
-| --- | --- | --- |
-| 调度队列 | 可执行 Task 引用，由 Harness 调度器消费 | Task 状态及可调度标记；成功 claimContext 后受理 |
-| Task 收件箱 | 用户输入、补充、取消、子结果，由目标任务执行者消费 | 稳定 Message 及处理状态；随实际处理提交确认 |
-
-首版由 Memory 的事务存储实现，不要求额外消息中间件。进程内通知和长轮询返回仅用于唤醒；服务重启或唤醒丢失后仍能读取持久队列。普通进度可供 read 查询，不必唤醒 Router 调用模型。
-
-### 4.2 原子边界
-
-1. submitTask：任务、独立 Context 起点、目标输入、待调度标记一致发布。
-2. claimContext：Task 可执行性、具体版本领取和待调度项受理一致更新；竞争者只能有一个成功。
-3. commitInteraction：版本、执行事件、Task 续接及本次输入消费一致提交。
-4. finishTask：任务终态、结果引用、领取释放、返回消息及目标任务的可调度标记一致提交。
-5. releaseClaim：注册等待条件时同时检查结果是否已到达，避免结果早于等待注册导致永久休眠。
-
-LLM 输出提交和 Task 结束可以分两步。若二者之间中断，恢复者读取已提交版本及任务状态，再幂等完成 finishTask；不得提前宣告任务完成，也不得因重复通知再执行已提交交互。
-
-### 4.3 投递、恢复与取消
-
-消息采用至少一次交付。目标按稳定 Message ID 去重；只有处理效果已持久化才确认消费。模型输入的消费由 commitInteraction 确认；纯控制消息可由对应领取、释放或任务终态提交确认。两类情况均不得“读到即删除”。
-
-同一 Router Task 的输入按收件箱顺序处理，完成通知建立新的对话轮次，不作为旧分派调用的第二次返回。多执行者竞争时，Task 状态和具体版本领取共同限制有效处理者。
-
-领取到期后，Memory 回收占用并恢复待核对标记；Harness 决定是否重试并重新安排执行者。未完成模型或工具调用先核对结果。旧凭证不得提交版本、任务终态或消费确认。
-
-取消通过 sendMessage 投递。对运行任务，Harness 的控制监听器立即调用宿主取消能力；对排队任务，可在核对修订后直接结束。取消确认通过 finishTask 统一返回；待处理输入、子任务传播范围和外部动作结果必须有明确处置。
-
-## 5. Trace 导入
-
-| 操作 | 输入 | 结果 |
-| --- | --- | --- |
-| importTrace | 稳定来源身份或 sourceKey，以及内容快照 | 固定 Session/Context 映射、版本、checkpoint、created/appended/unchanged/conflict |
-| getTraceImportState | sourceKey | 导入进度、摘要及知识提取覆盖范围、缺失或冲突 |
-
-一个 Trace 对应一个导入 Session 和一个 Context，无调度项、收件箱或 Event 流。重复导入按稳定身份定位，以记录身份和内容指纹对齐。普通追加增量发布，旧快照不回退，历史改写返回冲突。导入、摘要和知识提取分别记录进度。
-
-## 6. 典型交互
-
-<a id="6-完整例子规划行程中途纠正换-worker-后继续"></a>
+### 1.1 依赖方向
 
 ```text
-用户输入
-  → sendMessage(Router Task)
-  → receive 调度队列 → claimContext → Router 模型交互
-  → submitTask(工作任务，returnTo = Router Task)
-  → TaskAccepted → Router 保存本轮答复并等待
-
-receive 调度队列 → claimContext → Worker 模型/工具交互
-  → commitInteraction(最终结果)
-  → finishTask(结果引用)
-  → Router 收件箱新增结果消息并变为可调度
-  → Router 从自身续接版本处理新轮次 → 保存用户答复
+Harness ──调用──→ Memory ←──调用── 轨迹导入工具、其他应用
+Memory  ──✗──→ Harness          （Memory 从不调用 Harness）
 ```
 
-例如行程规划的父任务可分派交通、活动两个子任务。三个任务共用工作 Session 的事件流，使用独立 Context 版本；父任务释放执行名额后等待子结果，按自己的续接版本恢复。任务与返回地址稳定，执行进程可以替换。
+### 1.2 职责划分
+
+| 事项 | Harness | Memory |
+| --- | --- | --- |
+| Task、消息队列、租约、执行日志 | 拥有 | 不感知 |
+| 选择 Session、决定 contextName | Router 决定 | 提供 Session 目录检索 |
+| "同一 Context 同一时刻只有一个活跃 Task" | 负责保证 | 不感知 |
+| Context 版本的存储与读取 | 调用方 | 拥有 |
+| 提交版本的并发校验 | 声明基于哪个版本 | 执行乐观并发校验 |
+| 何时压缩 | 决定并发起，给出目标大小 | 执行压缩（调用 LLM 生成摘要）并代为提交 |
+| 何时回退、何时分叉 | 决定并执行 | 只存储结果 |
+| 记忆条目的提炼、修订与遗忘 | 提出候选、纠正、遗忘请求 | 拥有并执行 |
+| 摘要、画像、索引 | 只读使用 | 拥有，后台维护 |
+
+### 1.3 边界规则
+
+1. **Memory 只在请求时提交 Context 版本。** 版本由 Harness 或导入工具提交；压缩由 Harness 发起、Memory 代为执行并提交。Memory 的后台任务从不改动 Context，因此正在执行的 Context 不会被意外修改。
+2. **Harness 不直接写知识层。** 记忆条目只能经由反馈接口提出，由 Memory 校验后发布。
+3. **跨边界只传引用和不透明标识。** Step ID、消息 ID 由 Harness 生成，Memory 只把它们作为幂等键和元数据原样保存，不解释其含义。
+4. **两个系统之间没有分布式事务。** 一致性依靠"先在 Memory 提交内容，再在 Harness 提交控制状态"的顺序，见 §5。
+
+### 1.4 跨边界的标识
+
+| 标识 | 生成方 | Memory 中的用途 |
+| --- | --- | --- |
+| `sessionId`、`contextId`、`seq` | Memory | 对象身份 |
+| `contextName` | Router | Session 内的逻辑名称 |
+| `stepId` | Harness | 提交版本的幂等键 |
+| `messageId` | Harness | 版本中记录"本步骤纳入了哪些消息"，供恢复时去重 |
+| `idempotencyKey` | 调用方 | 其他写操作的幂等键 |
+
+## 2. Memory 接口
+
+所有接口都在已认证的用户域内调用，引用不能跨越用户域。所有写操作都是幂等的：相同的幂等键重试返回首次结果；相同的幂等键配上不同的内容，返回幂等冲突。
+
+### 2.1 Session
+
+| 操作 | 输入 | 输出与语义 |
+| --- | --- | --- |
+| `createSession` | 标题与目标、幂等键 | `sessionId` |
+| `getSession` | `sessionId` | Session 元数据、摘要，以及其下全部 Context（名称、`contextId`、最新版本序号） |
+| `searchSessions` | 查询文本、过滤条件（状态、时间范围）、数量上限 | 候选 Session 列表，含标题、摘要、最近活跃时间和相关度；供 Router 决定沿用还是新建 |
+
+### 2.2 Context
+
+| 操作 | 输入 | 输出与语义 |
+| --- | --- | --- |
+| `getOrCreateContext` | `sessionId`、`contextName`、初始内容（任务简报） | `contextId`、最新版本序号、是否新建。名称已存在时返回已有 Context，忽略初始内容 |
+| `forkContext` | 来源版本 `contextId@seq`、目标 `sessionId`、新 `contextName` | 新 `contextId`，第 1 个版本与来源版本内容相同，并记录来源。来源可以是任意历史版本，也可以跨 Session |
+| `readVersion` | `contextId@seq`，或 `contextId` 加 `head` | 版本快照（消息序列、指令、输入配置）与版本元数据（类型、`stepId`、已纳入的消息 ID、压缩元数据或放弃摘要） |
+| `listVersions` | `contextId`、范围 | 版本元数据列表，不含正文；用于挑选回退点或分叉点 |
+| `commitVersion` | `contextId`、基于的版本序号、版本类型、内容、`stepId`、已纳入的消息 ID、附带信息 | 成功返回新版本序号。基于的版本不是链尾时返回 `HEAD_CONFLICT` 和当前链尾；同一 `stepId` 重复提交返回已有版本 |
+| `compactContext` | `contextId`、基于的版本序号、目标 token 预算、保留策略（例如保留最近若干 token）、可选的压缩指令、幂等键 | 同步执行：Memory 调用 LLM 生成摘要，组装压缩版本并提交，返回新版本序号与压缩元数据。同样做乐观并发校验，链尾已变时返回 `HEAD_CONFLICT` |
+
+`commitVersion` 的版本类型与内容：
+
+| 类型 | 内容的传输方式 | 附带信息 |
+| --- | --- | --- |
+| `step` | 相对基础版本新增的消息（本步骤的输入、输出和工具结果） | — |
+| `compact` | 完整的新内容（摘要 + 保留的近期内容）；仅用于提交 Host 自行完成的压缩，常规压缩走 `compactContext` | 压缩元数据：压缩前大小、被压缩的版本范围、涉及的文件 |
+| `rollback` | 回退目标版本序号 | 放弃摘要：放弃了什么、为什么 |
+| `edit` | 对指定消息的替换或移除，只影响之后的版本 | 编辑原因 |
+
+逻辑上每个版本都是完整快照；表中的"传输方式"只是为了减少传输量，Memory 负责把它组装成完整快照。
+
+### 2.3 检索
+
+| 操作 | 输入 | 输出与语义 |
+| --- | --- | --- |
+| `recall` | 查询文本、范围（全部用户域、指定 Session 或 Context）、记忆类型过滤、数量上限 | 记忆条目、摘要片段和证据片段，每条都带溯源引用和可信度 |
+| `getProfile` | 可选的主题过滤 | 用户画像视图：相关记忆条目的聚合，带溯源 |
+| `readSource` | 溯源引用（版本中的消息、内容块、导入轨迹片段） | 原文；带墓碑的内容返回"已遗忘"标记，不返回原文 |
+
+### 2.4 记忆反馈
+
+| 操作 | 输入 | 输出与语义 |
+| --- | --- | --- |
+| `proposeMemory` | 候选内容、类型、来源引用、幂等键 | 候选 ID。Memory 校验后决定是否发布为记忆条目，不保证一定采纳 |
+| `correctMemory` | 记忆条目 ID 加修订号、纠正内容、理由 | 新修订号；修订号不是最新时返回冲突 |
+| `forget` | 目标（记忆条目、来源引用或整个 Session）、理由 | 墓碑 ID；墓碑异步传播到依赖它的条目和视图 |
+
+### 2.5 轨迹导入
+
+| 操作 | 输入 | 输出与语义 |
+| --- | --- | --- |
+| `importTrace` | 稳定来源标识、轨迹快照 | `created`、`appended`、`unchanged` 或 `conflict`，以及来源到 Session 和 Context 的映射 |
+| `getImportState` | 稳定来源标识 | 导入进度，以及摘要与记忆提炼的覆盖范围 |
+
+### 2.6 错误语义
+
+| 错误 | 含义 | 调用方的处理 |
+| --- | --- | --- |
+| `NOT_FOUND` | 引用的对象不存在 | 检查引用 |
+| `HEAD_CONFLICT` | 提交时基于的版本已不是链尾 | 放弃本步骤，不确认消息；通常说明租约已失效，应退出执行 |
+| `IDEMPOTENCY_CONFLICT` | 同一幂等键配上了不同的内容 | 视为调用方缺陷 |
+| `REVISION_CONFLICT` | 纠正记忆条目时修订号已过期 | 重新读取后再纠正 |
+| `SCOPE_DENIED` | 引用越出了当前用户域 | 拒绝，不重试 |
+| `UNAVAILABLE` | Memory 暂不可用 | 退避重试；期间不开始新步骤 |
+| `COMPACTION_FAILED` | 压缩时 LLM 调用失败，或无法压到目标预算以内 | 不产生新版本；Harness 可调整预算后重试，或让任务进入等待 |
+
+## 3. 场景一：Router 处理用户输入
+
+```mermaid
+sequenceDiagram
+    participant R as Router（Harness）
+    participant M as Memory
+
+    R->>M: readVersion(Router Context, head)
+    R->>M: recall / getProfile（按需，作为 Router 的工具）
+    R->>M: searchSessions(用户请求)
+    alt 沿用已有 Session
+        R->>M: getSession(sessionId)，查看已有 Context 名称
+    else 新的工作
+        R->>M: createSession(标题与目标)
+    end
+    Note over R: 在 Harness 内发布子任务 {sessionId, contextName, 简报, reply-to}
+    R->>M: commitVersion(Router Context, step)
+```
+
+发布子任务完全在 Harness 内部完成，不调用 Memory。
+
+## 4. 场景二：Worker 执行一个步骤
+
+```mermaid
+sequenceDiagram
+    participant W as Worker（Harness）
+    participant Q as 执行存储（Harness）
+    participant M as Memory
+
+    W->>Q: 拉取 Task，获取租约
+    W->>M: getOrCreateContext(sessionId, contextName, 简报)
+    loop 每个步骤
+        W->>M: readVersion(contextId, head) → 版本 N
+        W->>Q: 读取任务队列中未确认的消息
+        Note over W: 调用 LLM，执行工具
+        W->>M: commitVersion(基于 N, step, stepId, 消息 ID)
+        W->>Q: 确认这些消息
+    end
+    Note over W,Q: 结束：在执行存储中写入终态 + 结果消息（含结果版本引用 contextId@seq）
+```
+
+- 结果消息只携带版本引用。Router 需要细节时，用 `readVersion` 或 `readSource` 读取。
+- Context 正被其他 Task 占用时，由 Harness 判断，改为调用 `forkContext` 从其最新版本分叉。
+- 压缩：Harness 在步骤开始前发现上下文接近模型上限时，调用 `compactContext` 并等待返回，然后基于新版本继续。调用期间 Harness 一直持有租约，没有其他执行者能写入这个 Context。
+- 回退：Harness 用 `listVersions` 挑选回退点，以 `rollback` 类型提交；需要保留当前路线时改用 `forkContext`。
+
+## 5. 跨系统一致性
+
+一个步骤分两次写入，顺序固定：
+
+1. **在 Memory 提交版本**：这是步骤的提交点，提交成功，步骤就已生效。
+2. **在 Harness 确认消息、更新 Task 状态**。
+
+| 崩溃时机 | 恢复方式 |
+| --- | --- |
+| 第 1 步之前 | 整个步骤重做；工具以 `stepId + 工具调用 ID` 作为幂等键 |
+| 第 1 步与第 2 步之间 | 新的执行者 `readVersion(head)`，从版本元数据读出 `stepId` 和已纳入的消息 ID，补做确认，不重复执行 |
+| 第 2 步之后 | 无需处理 |
+
+失去租约的旧执行者即使继续运行，它的 `commitVersion` 也会因 `HEAD_CONFLICT` 失败，因此不会写坏 Context。
+
+## 6. 待细化
+
+- 字段级数据格式：版本内容、消息结构、溯源引用
+- `recall` 的查询模型与排序
+- `forget` 对正在使用的 Context 的影响：后续步骤是否遮蔽带墓碑的内容
+- 授权模型
+- 传输协议与 SDK 形态
+- 压缩策略：摘要提示词、如何利用已提炼的记忆条目、Memory 调用模型的配置与费用归属

@@ -1,6 +1,8 @@
 # Genvagent：统一用户记忆与可恢复的 Agent 执行
 
-> 历史设计，非当前实现契约。当前设计见 [Harness 架构](agent-harness.md)、[Memory 架构](memory-system.md)与[最小接口协议](integration-protocol.md)。本文中的 Session 级锁、History 和旧接口仅供历史查阅。
+> 已归档（v0.16 及以前），当前设计以 [概念模型](../concepts.md) 为准。
+>
+> 历史设计，非当前实现契约。当前设计见 [Harness 架构](../agent-harness.md)、[Memory 架构](../memory-system.md)与[最小接口协议](../integration-protocol.md)。本文中的 Session 级锁、History 和旧接口仅供历史查阅。
 
 状态：设计草案 v0.9；2026-11-17。当前仓库仅包含设计文档。
 
@@ -45,7 +47,7 @@ Memory 服务另提供执行协作存储
 
 集合可以不存在。一条 note 不必属于集合，也可关联多个集合；project notes 只是一种可选的资料组织方式，不进入系统的核心类型划分。第一版仍以单用户记忆域为边界，不设计跨用户团队知识库。
 
-Session 组织 History 与 Context：前者保存经历，后者保存当前如何继续。历史落盘不等于长期知识，Context 压缩不等于记忆沉淀；事件中的执行控制记录也不默认参与知识召回。完整对象关系与接口提供方见[概念模型与能力边界](integration-protocol.md)。
+Session 组织 History 与 Context：前者保存经历，后者保存当前如何继续。历史落盘不等于长期知识，Context 压缩不等于记忆沉淀；事件中的执行控制记录也不默认参与知识召回。完整对象关系与接口提供方见[概念模型与能力边界](../integration-protocol.md)。
 
 ## 2. Process、Session、Context 与 Task
 
@@ -105,7 +107,7 @@ Router session 的消息更新仍然串行，但它不等待 Worker 的完整 lo
 
 **执行环境（Runtime）** 是模型客户端、工具、进程、工作目录和权限等能力的实现，不是“一个 session 的另一份状态”。Runtime Driver 是 Core 调用这些能力的接口。**Run** 则是某个进程处理某个 session 的一次执行记录，两者不是同一个概念。
 
-Router 和 Worker 的循环推进规则都属于 Harness Core。Worker 负责具体任务的模型/工具步骤，Router 负责短对话与路由；两者共用 Core 的记录和上下文组件，调度互不等待。Core 还包含任务调度、Context 管理和 Memory 协调，具体对象及模块职责见 [Harness 设计](agent-harness.md)。
+Router 和 Worker 的循环推进规则都属于 Harness Core。Worker 负责具体任务的模型/工具步骤，Router 负责短对话与路由；两者共用 Core 的记录和上下文组件，调度互不等待。Core 还包含任务调度、Context 管理和 Memory 协调，具体对象及模块职责见 [Harness 设计](../agent-harness.md)。
 
 | 运行方式 | 谁调用下一次模型/工具 | Core 如何参与 |
 | --- | --- | --- |
@@ -227,7 +229,7 @@ CLM 延后作为对照实验，不作为第一版依赖，也不向模型开放�
 | 记忆整理、notes 修订与删除 | Memory Agent / 维护任务 | 带来源修订、状态、失效和保留策略 |
 | 外部工具、文件和活跃进程 | 执行环境 / Host | 执行日志、外部状态与恢复机制 |
 
-1. [对象模型、接口与完整流程](integration-protocol.md)：接口提供方、调用方、逻辑操作及从用户输入到记忆整理的实例。
-2. [Agent Harness](agent-harness.md)：执行对象、Core 模块、两个 loop 与可插件化边界。
-3. [Memory System](memory-system.md)：存储、任务视图、session 维护、notes 生命周期及部署。
+1. [对象模型、接口与完整流程](../integration-protocol.md)：接口提供方、调用方、逻辑操作及从用户输入到记忆整理的实例。
+2. [Agent Harness](../agent-harness.md)：执行对象、Core 模块、两个 loop 与可插件化边界。
+3. [Memory System](../memory-system.md)：存储、任务视图、session 维护、notes 生命周期及部署。
 4. [接口实现参考](integration-reference.md)：候选 SDK、载荷、传输机制与 Host 具体适配，尚未冻结。
