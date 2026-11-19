@@ -37,30 +37,32 @@ Super Agent 针对这三点分别给出：
 
 ```mermaid
 flowchart TB
-    U[用户] <--> R
+    U([User]) <--> H
 
-    subgraph H[Agent Harness · 基于 dsh / pi 实现]
+    subgraph H[Agent Harness · built on dsh / pi]
         direction LR
-        R[Router] -->|发布任务| Q[[消息队列]]
-        Q -->|拉取| W[Worker 池<br/>多个 Worker 并行]
-        W -->|结果回报| Q
-        Q -->|唤醒| R
+        R[Router] <-->|tasks / results| Q[[Message Queue]] <-->|tasks / results| W[Worker Pool]
     end
 
-    R -->|读写 Context · 检索| M
-    W -->|读写 Context · 提交版本| M
+    H <-->|read / commit context · recall knowledge| M
 
     subgraph M[Memory System]
         direction LR
-        C[(Context<br/>版本链)]
-        K[(知识<br/>记忆条目 · 方法 · 本体)]
-        S[(奖励信号)]
-        MA[Memory Agent<br/>提炼 · 压缩 · 挖掘]
+        subgraph EV[Evidence]
+            C[(Context Versions)]
+            TR[(Imported Traces)]
+        end
+        MA[Memory Agent<br/>consolidate · compact · mine]
+        subgraph OUT[Produced by Memory Agent]
+            K[(Knowledge & Ontology)]
+            S[(Reward Signals)]
+        end
+        EV --> MA --> OUT
     end
 
-    T[外部轨迹] -->|导入| M
-    M <-->|联合协议| F[其他 Memory System]
-    M -->|信号与数据| I[自我改进<br/>评测 · 技能 · 训练数据]
+    X[External Traces] -->|import| M
+    M <-->|knowledge federation| F[Peer Memory Systems]
+    M -->|reward signals| I[Self-Improvement<br/>evals · skills · training data]
 ```
 
 | 组成 | 说明 |
