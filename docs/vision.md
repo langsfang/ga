@@ -35,34 +35,40 @@ Super Agent 针对这三点分别给出：
 
 ## 3. 总体架构
 
-```mermaid
-flowchart TB
-    U([User]) <--> H
-
-    subgraph H[Agent Harness · built on dsh / pi]
-        direction LR
-        R[Router] <-->|tasks / results| Q[[Message Queue]] <-->|tasks / results| W[Worker Pool]
-    end
-
-    H <-->|read / commit context · recall knowledge| M
-
-    subgraph M[Memory System]
-        direction LR
-        subgraph EV[Evidence]
-            C[(Context Versions)]
-            TR[(Imported Traces)]
-        end
-        MA[Memory Agent<br/>consolidate · compact · mine]
-        subgraph OUT[Produced by Memory Agent]
-            K[(Knowledge & Ontology)]
-            S[(Reward Signals)]
-        end
-        EV --> MA --> OUT
-    end
-
-    X[External Traces] -->|import| M
-    M <-->|knowledge federation| F[Peer Memory Systems]
-    M -->|reward signals| I[Self-Improvement<br/>evals · skills · training data]
+```text
+        User                                                             External Traces
+          ^                                                                      
+          |                                                                     |
+          v                                                                     |
++---------+--- Agent Harness (built on dsh / pi) ----------------------+        |
+|                                                                      |        |
+|                                  +-- Worker Pool ------------------+ |        |
+|  +-------------+                 |                                 | |        |
+|  | Router      |  message queue  | +--------+ +--------+           | |        |
+|  | (machine A) | <-------------> | |Worker  | |Worker  |    ...    | |        |
+|  +-------------+                 | |(mach B)| |(mach C)|           | |        |
+|                                  | +--------+ +--------+           | |        |
+|                                  +---------------------------------+ |        |
++---------+-----------------------------------------+------------------+        |
+          ^                                         ^                           |
+          | read / commit context                   | read / commit context     | import
+          | recall knowledge                        | recall knowledge          |
+          v                                         v                           v
++---------+--- Memory System -----------------------+---------------------------+--------+
+|                                                                                        |
+|   Evidence                    Memory Agent              Produced                       |
+|  +------------------+       +----------------+       +------------------+              |
+|  | Context Versions |       | consolidate    |       | Knowledge        |              |
+|  | Imported Traces  | ----> | compact        | ----> | Ontology         |              |
+|  | User Materials   |       | mine           |       | Reward Signals   |              |
+|  +------------------+       +----------------+       +------------------+              |
++-------------------+---------------------------------------------+----------------------+
+                    ^                                             |  reward-labeled
+                    | federation                                  |  trajectories
+                    v                                             v
+         +---------------------+                    +--------------------------+
+         | Peer Memory Systems |                    | Post-training (SFT / RL) |
+         +---------------------+                    +--------------------------+
 ```
 
 | 组成 | 说明 |
