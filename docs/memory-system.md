@@ -14,7 +14,7 @@ Memory System 是以用户域为边界的记忆服务：保存工作上下文与
 | 来源资料与外部轨迹导入 | 业务 LLM 调用与工具执行 |
 | 记忆条目的提炼、修订与遗忘（墓碑） | 执行日志（留在 Harness，不导入） |
 | 应 Harness 请求执行 Context 压缩 | 决定何时压缩（属于 Harness） |
-| Session 目录、摘要、画像、检索 | |
+| Session 目录（含每个 Context 的用途摘要）、摘要、画像、检索 | |
 
 ## 2. 数据分层
 
@@ -30,7 +30,7 @@ Memory System 是以用户域为边界的记忆服务：保存工作上下文与
 
 - 一个 Context 是一条线性版本链，链尾就是它的最新版本（head）。每个版本逻辑上是完整快照，物理上通过共享内容块避免重复存储。
 - **标识**：`contextId` 是全局唯一标识；`contextName` 是 Session 内的逻辑名称，与 `contextId` 一一对应且永不重新绑定；版本以 Context 内递增序号 `seq` 标识，引用写作 `contextId@seq`。
-- **查找或创建（get-or-create）**：按 `(sessionId, contextName)` 原子地取得 Context，不存在就新建，并发调用只会得到同一个 Context。
+- **创建（create）**：在 Session 内以给定名称新建 Context；名称已被占用时拒绝并返回已有的 `contextId`；以幂等键去重。Memory 不做"按名称查找或创建"，沿用哪个 Context 由调用方从列表中选择。
 - **提交（commit）**：在链尾之后提交新版本，必须声明基于哪个版本，只有该版本仍是链尾才能成功（乐观并发控制）。Harness 的一个步骤对应一次提交；版本中记录 Step ID 和已纳入的消息 ID，同一 Step ID 的重复提交返回同一个版本。
 - **读取**：LLM 调用只使用最新版本这一份快照，历史版本不发给 LLM。
 - **分叉（fork）**：以任意 Context 的任意版本（包括历史版本）为起点创建新 Context，记录来源版本，与原 Context 共享已有正文。

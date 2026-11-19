@@ -31,7 +31,7 @@ Genvagent 要解决两个问题：
 flowchart LR
     U[用户] <--> R[Router]
     subgraph H[Agent Harness]
-        R -->|发布任务 sessionId + contextName| DQ[调度队列]
+        R -->|发布任务 sessionId + contextId| DQ[调度队列]
         DQ -->|亲和优先，超时回退| W[Worker 池<br/>多实例 × 多槽位]
         W -->|结果消息 reply-to| TQ[任务队列]
         TQ --> R
@@ -66,18 +66,18 @@ flowchart LR
 | --- | --- | --- |
 | `sessionId` | Memory | Session 的全局唯一标识，创建后不变 |
 | `contextId` | Memory | Context 的全局唯一标识，创建后不变；系统内部引用一律使用它 |
-| `contextName` | Router | Context 在所属 Session 内的逻辑名称，例如 `交通`、`住宿`；Session 内唯一。`(sessionId, contextName)` 与 `contextId` 一一对应，绑定后永不改变 |
+| `contextName` | Router | Context 在所属 Session 内的逻辑名称，例如 `交通`、`住宿`，由 Router 在新建时给出；Session 内唯一。`(sessionId, contextName)` 与 `contextId` 一一对应，绑定后永不改变 |
 | `seq` | Memory | 版本序号：Context 内从 1 开始单调递增 |
 | 版本引用 | — | `contextId@seq`，唯一定位一个不可变版本 |
 
-`contextName` 是给 Router 和人看的语义名称；`contextId` 是给系统用的稳定引用。只给出名称时，Memory 通过"查找或创建"把它解析为 `contextId`。
+`contextName` 是给 Router 和人看的语义名称；`contextId` 是给系统用的稳定引用。任务里只携带 `contextId`：沿用已有 Context 靠从列表中选择，不靠名称匹配，见 [§4.2](#42-指派规则)。
 
 **版本模型**：
 
 - **提交（commit）**：在链尾之后提交一个新版本，新版本成为新的链尾；Context 内不产生分支。提交时必须声明基于哪个版本，只有该版本仍是链尾才能成功（乐观并发控制，optimistic concurrency control）。
 - **读取**：LLM 调用只使用最新版本这一份快照；历史版本只用于溯源和回退，不会发给 LLM。
 - **分叉（fork）**：以任意 Context 的任意版本（包括历史版本，不限于最新版本）为起点创建新 Context，记录来源版本，与原 Context 共享已有正文。原 Context 不受影响，继续前进。
-- **查找或创建（get-or-create）**：按 `(sessionId, contextName)` 原子地取得 Context，不存在就新建；并发调用只会得到同一个 Context。
+- **创建（create）**：在 Session 内以给定的 `contextName` 新建 Context，初始内容通常是任务简报。名称已被占用时拒绝，并返回已有 Context 的 `contextId`；以幂等键去重，重试不会重复创建。
 
 提交与分叉的取舍原则：**同一件工作的延续，在原 Context 上提交新版本；需要两条路线并存，才分叉出新 Context。**
 
@@ -123,7 +123,7 @@ Context A（交通）: v1 → v2 → v3 → v4(压缩) → v5
 | --- | --- |
 | Agent 角色（Agent Role） | 指令、工具集与终止条件的配置。**Router** 是面向用户的编排角色，负责理解、澄清、委派和汇总；**Worker** 负责执行具体任务 |
 | Agent 实例（Agent Instance） | 正在运行某个 Task 的执行体，可以随时替换，不持有权威状态 |
-| 任务（Task） | 持久化的工作单元：目标、约束、完成条件、父任务、回复地址（reply-to）、所属 Session、contextName 和状态。Router 与用户的持续对话也是一个长期 Task |
+| 任务（Task） | 持久化的工作单元：目标、约束、完成条件、父任务、回复地址（reply-to）、所属 Session、使用的 Context（`contextId`）和状态。Router 与用户的持续对话也是一个长期 Task |
 | 租约（Lease） | Task 的独占执行权，带过期时间和防护令牌（fencing token）；令牌过期后，旧持有者的写入一律被拒绝。语义上类似消息队列中的可见性超时（visibility timeout） |
 | 步骤（Step） | 一次 LLM 调用，加上它触发的全部工具执行。一个步骤结束时整体提交，在 Context 上生成一个新版本 |
 | 执行日志（Execution Log） | Task 状态变化、步骤和租约事件的追加写（append-only）记录，只用于审计和故障排查，不导入 Memory |
@@ -138,15 +138,26 @@ Context A（交通）: v1 → v2 → v3 → v4(压缩) → v5
 | 属于哪件事：沿用哪个 Session、使用哪个 Context | 语义判断 | Router，借助 Memory 的 Session 目录检索 |
 | 由谁来执行 | 机械分配 | 消息队列：亲和优先，超时回退为竞争拉取 |
 
-Router 发布任务时指定：
+**Router 先确定 Context，再发布任务。** 步骤如下：
 
-- **sessionId**：沿用已有 Session，或新建。
-- **contextName**：要使用的 Context 的名称。Router 不需要知道它是否已经存在，也不指定版本，总是从最新版本继续。
-  - 不给出 contextName 时，Harness 生成一个新名称，即一次性的新 Context。
-  - 可以显式给出分叉来源（某个 Context 的某个版本），用于并行探索或从历史某点重来。
-- **任务简报**：目标、约束和必要的引用材料。新建的 Context 只携带任务简报，不继承父任务的完整上下文。
+1. **选定 Session**：用 `searchSessions` 检索，沿用已有的或新建。
+2. **查看已有 Context**：用 `getSession` 列出 Session 内的全部 Context，包括名称、用途摘要、最近活动时间，以及是否有未结束的 Task（后一项由 Harness 补充）。
+3. **三选一**：
+   - **沿用**：从列表中选一个 `contextId`，从它的最新版本继续。
+   - **新建**：给出 `contextName` 和任务简报，调用 `createContext`，得到 `contextId`。新建的 Context 只携带任务简报，不继承父任务的完整上下文。
+   - **分叉**：指定来源版本 `contextId@seq`，用于并行探索或从历史某点重来。
+4. **发布任务** `{sessionId, contextId, 任务简报, reply-to}`。沿用时，任务简报作为第一条输入消息送入；新建时它已是 Context 的初始内容。
 
-Worker 拉到任务后，按 `(sessionId, contextName)` 查找或创建 Context，不自己判断"相关性"。同一个 Context 同一时刻只能有一个活跃 Task；如果 Context 正被占用，从它的最新版本分叉出新 Context，而不是抢用。
+选择规则：
+
+- **沿用靠选择，不靠名称匹配。** Router 从列表中选 `contextId`，不靠"写出同一个名称"来命中已有 Context。
+- **名称唯一。** 新建时名称已被占用，`createContext` 拒绝并返回已有的 `contextId`，由 Router 决定沿用它还是换一个名称。
+- **外部实体用确定性名称。** 工作对应外部实体（如 GitHub Issue、PR、飞书话题、某个文件）时，名称由实体的稳定标识派生，例如 `github:owner/repo#123`。
+- **拿不准时新建。** 误沿用会让模型看到无关历史，而且不易察觉；误新建的损失可以通过 Session 范围的 `recall` 找回大部分。
+- **一个 Context 只能有一个未结束的 Task。** 选中的 Context 已有未结束的 Task 时，新要求应作为消息发给那个 Task；确实需要并行时，从它的最新版本分叉。这条规则由 Harness 在发布时检查。
+- **记录选择理由**：Task 中记下 Router 为什么沿用或新建，用于审计和改进 Router 的提示词。
+
+Worker 拉到任务后直接使用任务中的 `contextId`，不再判断相关性。
 
 **亲和（Affinity）**：Worker 进程里可能还留着上次执行时的资源，例如文件句柄、子进程、工作目录和缓存，所以任务应尽量回到上次执行同一 Context 的 Worker。采用**软亲和（soft affinity）**：
 
@@ -179,14 +190,14 @@ Harness 内部采用标准消息队列模型：
 
 ```text
 用户输入 → Router
-  → 检索 Session 目录，决定 sessionId（沿用或新建）和 contextName
-  → 发布任务 {sessionId, contextName, 任务简报, reply-to}
+  → 检索 Session 目录，决定 sessionId（沿用或新建）
+  → 查看 Session 内的 Context，选定 contextId：沿用、新建（createContext）或分叉
+  → 发布任务 {sessionId, contextId, 任务简报, reply-to}
      （有亲和目标则进入其专属队列，否则进入调度队列）
   → 立即答复"已受理"，结束本步骤，不等待子任务完成
 
 Worker 拉取任务，获得租约
-  → Memory 查找或创建 (sessionId, contextName) 对应的 Context
-  → 逐步执行
+  → 读取 contextId 的最新版本，逐步执行
 ```
 
 **执行一步**：
@@ -213,7 +224,7 @@ Worker 拉取任务，获得租约
 
 ## 6. 核心不变量
 
-1. 同一 Task 在任一时刻最多有一个持有有效租约的执行者；同一 Context 在任一时刻最多被一个活跃 Task 使用。
+1. 同一 Task 在任一时刻最多有一个持有有效租约的执行者；同一 Context 在任一时刻最多有一个未结束的 Task。
 2. Context 版本不可变；一个 Context 的版本线性演进，提交新版本必须基于当前链尾。
 3. `(sessionId, contextName)` 与 `contextId` 的绑定一旦建立，永不改变。
 4. 一个步骤恰好对应一个新版本；对同一 Step ID 的重复提交返回同一个版本。
@@ -253,9 +264,11 @@ Worker 拉取任务，获得租约
 | 任务指派 | 软亲和：优先回到上次的 Worker，超时回退为竞争拉取 |
 | 压缩的执行方 | Harness 决定何时压缩并给出目标大小；Memory 执行压缩并代为提交 |
 | 跨 Session 分叉 | 允许：可以从其他 Session 的任意版本分叉 |
+| Context 选择 | Router 在发布任务前确定 `contextId`：从已有 Context 中选择，或新建、分叉；拿不准时新建 |
 
 待决问题：
 
 - **亲和超时**：回退等待时间如何设定，是否按任务类型区分。
 - **授权模型**：单用户之外的共享与委托访问。很重要，留待后续分析。
 - **墓碑的边界**：墓碑不做物理删除，如果将来有合规层面的硬删除需求，可以叠加加密擦除（crypto-shredding）。另一个问题是，已有 Context 的后续步骤是否要遮蔽带墓碑的内容。
+- **Context 选错的兜底**：新建时 Memory 是否提示 Session 内用途相似的 Context；Worker 第一步发现沿用的 Context 与简报无关时，是否报告"不匹配"并改为新建。

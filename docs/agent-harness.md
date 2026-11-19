@@ -140,12 +140,13 @@ sequenceDiagram
     U->>RQ: 输入（经 Host 入口写入）
     RQ->>RD: Router Task 被唤醒
     RD->>R: 拉取，获取租约
-    R->>M: 检索 Session 目录
-    R->>WD: 委派：创建子 Task {sessionId, contextName, 简报, reply-to = Router Task}
+    R->>M: 检索 Session 目录，查看已有 Context
+    R->>M: 选定 contextId（沿用，或 createContext / forkContext）
+    R->>WD: 委派：创建子 Task {sessionId, contextId, 简报, reply-to = Router Task}
     R->>U: 答复"已受理"
     R->>R: 提交版本，Router Task 转为 waiting，释放租约
     WD->>W: 拉取，获取租约
-    W->>M: 查找或创建 Context
+    W->>M: 读取 Context 最新版本
     loop 每个步骤
         W->>M: 提交新版本
     end
@@ -187,8 +188,8 @@ stateDiagram-v2
     waiting --> cancelled
 ```
 
-- Router 发布任务时指定 sessionId 和 contextName；Worker 按这两者在 Memory 中查找或创建 Context，不自行判断相关性，见[指派规则](concepts.md#42-指派规则)。
-- 同一 Context 同一时刻只能有一个活跃 Task；被占用时从其最新版本分叉。
+- Router 在发布任务前确定 `contextId`（沿用、新建或分叉），Worker 直接使用，不自行判断相关性，见[指派规则](concepts.md#42-指派规则)。
+- 同一 Context 同一时刻只能有一个未结束的 Task，Harness 在发布时检查：已有时，新要求作为消息发给那个 Task；确需并行则分叉。
 - Router 的对话 Task 在没有新消息时处于 waiting，等待条件是"任意新消息"；Router 实例不需要常驻。
 
 ## 6. 并发与故障模型

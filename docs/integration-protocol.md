@@ -18,7 +18,7 @@ Memory  ──✗──→ Harness          （Memory 从不调用 Harness）
 | 事项 | Harness | Memory |
 | --- | --- | --- |
 | Task、消息队列、租约、执行日志 | 拥有 | 不感知 |
-| 选择 Session、决定 contextName | Router 决定 | 提供 Session 目录检索 |
+| 选择 Session、选择或新建 Context | Router 决定 | 提供 Session 目录检索、Context 列表与用途摘要 |
 | "同一 Context 同一时刻只有一个活跃 Task" | 负责保证 | 不感知 |
 | Context 版本的存储与读取 | 调用方 | 拥有 |
 | 提交版本的并发校验 | 声明基于哪个版本 | 执行乐观并发校验 |
@@ -39,7 +39,7 @@ Memory  ──✗──→ Harness          （Memory 从不调用 Harness）
 | 标识 | 生成方 | Memory 中的用途 |
 | --- | --- | --- |
 | `sessionId`、`contextId`、`seq` | Memory | 对象身份 |
-| `contextName` | Router | Session 内的逻辑名称 |
+| `contextName` | Router | Session 内的逻辑名称，新建时给出，只用于展示和防重名 |
 | `stepId` | Harness | 提交版本的幂等键 |
 | `messageId` | Harness | 版本中记录"本步骤纳入了哪些消息"，供恢复时去重 |
 | `idempotencyKey` | 调用方 | 其他写操作的幂等键 |
@@ -53,14 +53,14 @@ Memory  ──✗──→ Harness          （Memory 从不调用 Harness）
 | 操作 | 输入 | 输出与语义 |
 | --- | --- | --- |
 | `createSession` | 标题与目标、幂等键 | `sessionId` |
-| `getSession` | `sessionId` | Session 元数据、摘要，以及其下全部 Context（名称、`contextId`、最新版本序号） |
+| `getSession` | `sessionId` | Session 元数据、摘要，以及其下全部 Context：名称、`contextId`、最新版本序号、用途摘要、最近提交时间、分叉来源。供 Router 选择沿用哪个 Context |
 | `searchSessions` | 查询文本、过滤条件（状态、时间范围）、数量上限 | 候选 Session 列表，含标题、摘要、最近活跃时间和相关度；供 Router 决定沿用还是新建 |
 
 ### 2.2 Context
 
 | 操作 | 输入 | 输出与语义 |
 | --- | --- | --- |
-| `getOrCreateContext` | `sessionId`、`contextName`、初始内容（任务简报） | `contextId`、最新版本序号、是否新建。名称已存在时返回已有 Context，忽略初始内容 |
+| `createContext` | `sessionId`、`contextName`、初始内容（任务简报）、幂等键 | `contextId`。名称已被占用时返回 `NAME_TAKEN` 和已有的 `contextId`，不创建 |
 | `forkContext` | 来源版本 `contextId@seq`、目标 `sessionId`、新 `contextName` | 新 `contextId`，第 1 个版本与来源版本内容相同，并记录来源。来源可以是任意历史版本，也可以跨 Session |
 | `readVersion` | `contextId@seq`，或 `contextId` 加 `head` | 版本快照（消息序列、指令、输入配置）与版本元数据（类型、`stepId`、已纳入的消息 ID、压缩元数据或放弃摘要） |
 | `listVersions` | `contextId`、范围 | 版本元数据列表，不含正文；用于挑选回退点或分叉点 |
@@ -109,6 +109,7 @@ Memory  ──✗──→ Harness          （Memory 从不调用 Harness）
 | `HEAD_CONFLICT` | 提交时基于的版本已不是链尾 | 放弃本步骤，不确认消息；通常说明租约已失效，应退出执行 |
 | `IDEMPOTENCY_CONFLICT` | 同一幂等键配上了不同的内容 | 视为调用方缺陷 |
 | `REVISION_CONFLICT` | 纠正记忆条目时修订号已过期 | 重新读取后再纠正 |
+| `NAME_TAKEN` | 新建 Context 时名称在 Session 内已被占用 | 由 Router 决定沿用返回的 Context，或换一个名称 |
 | `SCOPE_DENIED` | 引用越出了当前用户域 | 拒绝，不重试 |
 | `UNAVAILABLE` | Memory 暂不可用 | 退避重试；期间不开始新步骤 |
 | `COMPACTION_FAILED` | 压缩时 LLM 调用失败，或无法压到目标预算以内 | 不产生新版本；Harness 可调整预算后重试，或让任务进入等待 |
@@ -124,15 +125,22 @@ sequenceDiagram
     R->>M: recall / getProfile（按需，作为 Router 的工具）
     R->>M: searchSessions(用户请求)
     alt 沿用已有 Session
-        R->>M: getSession(sessionId)，查看已有 Context 名称
+        R->>M: getSession(sessionId)，查看已有 Context
     else 新的工作
         R->>M: createSession(标题与目标)
     end
-    Note over R: 在 Harness 内发布子任务 {sessionId, contextName, 简报, reply-to}
+    alt 沿用 Context
+        Note over R: 从列表中选定 contextId
+    else 新建
+        R->>M: createContext(sessionId, contextName, 简报, 幂等键 = 子 Task ID)
+    else 分叉
+        R->>M: forkContext(contextId@seq, sessionId, 新 contextName)
+    end
+    Note over R: 在 Harness 内发布子任务 {sessionId, contextId, 简报, reply-to}
     R->>M: commitVersion(Router Context, step)
 ```
 
-发布子任务完全在 Harness 内部完成，不调用 Memory。
+Context 在发布任务之前就已确定。新建时以子 Task ID 作为幂等键，Router 在创建与发布之间崩溃，重试也只会得到同一个 Context。发布子任务本身在 Harness 内部完成，不调用 Memory。
 
 ## 4. 场景二：Worker 执行一个步骤
 
@@ -143,7 +151,6 @@ sequenceDiagram
     participant M as Memory
 
     W->>Q: 拉取 Task，获取租约
-    W->>M: getOrCreateContext(sessionId, contextName, 简报)
     loop 每个步骤
         W->>M: readVersion(contextId, head) → 版本 N
         W->>Q: 读取任务队列中未确认的消息
@@ -155,7 +162,6 @@ sequenceDiagram
 ```
 
 - 结果消息只携带版本引用。Router 需要细节时，用 `readVersion` 或 `readSource` 读取。
-- Context 正被其他 Task 占用时，由 Harness 判断，改为调用 `forkContext` 从其最新版本分叉。
 - 压缩：Harness 在步骤开始前发现上下文接近模型上限时，调用 `compactContext` 并等待返回，然后基于新版本继续。调用期间 Harness 一直持有租约，没有其他执行者能写入这个 Context。
 - 回退：Harness 用 `listVersions` 挑选回退点，以 `rollback` 类型提交；需要保留当前路线时改用 `forkContext`。
 
